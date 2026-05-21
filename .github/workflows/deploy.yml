@@ -30,10 +30,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 20
-          cache: npm
+          #cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       # svelte-kit sync regenerates .svelte-kit/tsconfig.json which the
       # project tsconfig.json extends — vitest needs that to resolve types.
