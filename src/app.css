@@ -1,0 +1,348 @@
+/* ============================================================
+   SensorLab — iOS Human Interface Guidelines aesthetic.
+
+   - Typography: -apple-system / SF Pro stack, SF Mono for data
+   - Colors: iOS semantic system colors (label, secondaryLabel,
+     systemBackground, systemGroupedBackground, separator,
+     systemBlue/Green/Red/Orange) light + dark
+   - Radii: 10-13px for cards, 8px for buttons (iOS standards)
+   - Touch targets: 44px minimum
+   - Safe-area insets for notch / home indicator
+
+   The dark theme switches automatically via prefers-color-scheme
+   when theme=auto, or can be forced via [data-theme=dark|light].
+   ============================================================ */
+
+/* ---- LIGHT THEME (default) -------------------------------- */
+:root {
+  /* Backgrounds (iOS systemGroupedBackground + cards) */
+  --bg: #f2f2f7;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #f9f9fb;
+  --bg-grouped: #f2f2f7;
+
+  /* Labels (iOS label hierarchy) */
+  --fg: #000000;
+  --fg-secondary: rgba(60, 60, 67, 0.60);
+  --fg-tertiary: rgba(60, 60, 67, 0.30);
+  --fg-quaternary: rgba(60, 60, 67, 0.18);
+
+  /* Separators */
+  --separator: rgba(60, 60, 67, 0.29);
+  --separator-opaque: #c6c6c8;
+
+  /* Fills (used for tinted button backgrounds, controls) */
+  --fill: rgba(120, 120, 128, 0.20);
+  --fill-secondary: rgba(120, 120, 128, 0.16);
+  --fill-tertiary: rgba(118, 118, 128, 0.12);
+
+  /* iOS system tint colors */
+  --tint: #007aff;        /* systemBlue — primary accent */
+  --tint-dim: rgba(0, 122, 255, 0.15);
+  --success: #34c759;     /* systemGreen — running */
+  --danger: #ff3b30;      /* systemRed — errors */
+  --warn: #ff9500;        /* systemOrange — recording / warnings */
+  --warn-dim: rgba(255, 149, 0, 0.15);
+
+  /* Chart palette (iOS-ish multi-colors used in legends) */
+  --series-1: #007aff;    /* blue */
+  --series-2: #34c759;    /* green */
+  --series-3: #ff3b30;    /* red */
+  --series-4: #ff9500;    /* orange */
+  --grid: rgba(60, 60, 67, 0.12);
+
+  /* Type ramp (iOS Dynamic Type analogues, fixed) */
+  --t-large-title: 34px;
+  --t-title-1: 28px;
+  --t-title-2: 22px;
+  --t-title-3: 20px;
+  --t-headline: 17px;
+  --t-body: 17px;
+  --t-callout: 16px;
+  --t-subhead: 15px;
+  --t-footnote: 13px;
+  --t-caption-1: 12px;
+  --t-caption-2: 11px;
+
+  /* Radii (iOS standards) */
+  --r-card: 12px;
+  --r-button: 10px;
+  --r-pill: 999px;
+  --r-control: 8px;
+
+  /* Touch target minimum */
+  --touch: 44px;
+
+  /* Fonts */
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+          "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
+
+  /* Safe-area aliases */
+  --safe-top: env(safe-area-inset-top);
+  --safe-bottom: env(safe-area-inset-bottom);
+  --safe-left: env(safe-area-inset-left);
+  --safe-right: env(safe-area-inset-right);
+}
+
+/* ---- DARK THEME (auto via prefers-color-scheme) ----------- */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='auto'] {
+    --bg: #000000;
+    --bg-elev: #1c1c1e;
+    --bg-elev-2: #2c2c2e;
+    --bg-grouped: #000000;
+
+    --fg: #ffffff;
+    --fg-secondary: rgba(235, 235, 245, 0.60);
+    --fg-tertiary: rgba(235, 235, 245, 0.30);
+    --fg-quaternary: rgba(235, 235, 245, 0.16);
+
+    --separator: rgba(84, 84, 88, 0.60);
+    --separator-opaque: #38383a;
+
+    --fill: rgba(120, 120, 128, 0.36);
+    --fill-secondary: rgba(120, 120, 128, 0.32);
+    --fill-tertiary: rgba(118, 118, 128, 0.24);
+
+    --tint: #0a84ff;
+    --tint-dim: rgba(10, 132, 255, 0.20);
+    --success: #30d158;
+    --danger: #ff453a;
+    --warn: #ff9f0a;
+    --warn-dim: rgba(255, 159, 10, 0.20);
+
+    --series-1: #0a84ff;
+    --series-2: #30d158;
+    --series-3: #ff453a;
+    --series-4: #ff9f0a;
+    --grid: rgba(235, 235, 245, 0.10);
+  }
+}
+
+/* ---- DARK THEME (forced) ---------------------------------- */
+:root[data-theme='dark'] {
+  --bg: #000000;
+  --bg-elev: #1c1c1e;
+  --bg-elev-2: #2c2c2e;
+  --bg-grouped: #000000;
+
+  --fg: #ffffff;
+  --fg-secondary: rgba(235, 235, 245, 0.60);
+  --fg-tertiary: rgba(235, 235, 245, 0.30);
+  --fg-quaternary: rgba(235, 235, 245, 0.16);
+
+  --separator: rgba(84, 84, 88, 0.60);
+  --separator-opaque: #38383a;
+
+  --fill: rgba(120, 120, 128, 0.36);
+  --fill-secondary: rgba(120, 120, 128, 0.32);
+  --fill-tertiary: rgba(118, 118, 128, 0.24);
+
+  --tint: #0a84ff;
+  --tint-dim: rgba(10, 132, 255, 0.20);
+  --success: #30d158;
+  --danger: #ff453a;
+  --warn: #ff9f0a;
+  --warn-dim: rgba(255, 159, 10, 0.20);
+
+  --series-1: #0a84ff;
+  --series-2: #30d158;
+  --series-3: #ff453a;
+  --series-4: #ff9f0a;
+  --grid: rgba(235, 235, 245, 0.10);
+}
+
+/* ---- RESET & BASE ----------------------------------------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: var(--t-body);
+  line-height: 1.35;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- TYPOGRAPHY UTILITIES --------------------------------- */
+.large-title { font-size: var(--t-large-title); font-weight: 700; letter-spacing: 0.37px; }
+.title-1     { font-size: var(--t-title-1);    font-weight: 700; letter-spacing: 0.36px; }
+.title-2     { font-size: var(--t-title-2);    font-weight: 700; letter-spacing: 0.35px; }
+.title-3     { font-size: var(--t-title-3);    font-weight: 600; letter-spacing: 0.38px; }
+.headline    { font-size: var(--t-headline);   font-weight: 600; letter-spacing: -0.41px; }
+.body        { font-size: var(--t-body);       font-weight: 400; letter-spacing: -0.41px; }
+.callout     { font-size: var(--t-callout);    font-weight: 400; letter-spacing: -0.32px; }
+.subhead     { font-size: var(--t-subhead);    font-weight: 400; letter-spacing: -0.24px; color: var(--fg-secondary); }
+.footnote    { font-size: var(--t-footnote);   font-weight: 400; letter-spacing: -0.08px; color: var(--fg-secondary); }
+.caption-1   { font-size: var(--t-caption-1);  font-weight: 400; letter-spacing: 0px;     color: var(--fg-secondary); }
+.caption-2   { font-size: var(--t-caption-2);  font-weight: 400; letter-spacing: 0.07px;  color: var(--fg-secondary); text-transform: uppercase; }
+
+.value-mono     { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.value-large    { font-family: var(--mono); font-size: 28px; font-weight: 500; letter-spacing: -0.02em; }
+.value-medium   { font-family: var(--mono); font-size: 22px; font-weight: 500; }
+.value-small    { font-family: var(--mono); font-size: 15px; font-weight: 500; }
+
+.label-up {
+  font-size: var(--t-caption-2);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-secondary);
+}
+
+/* ---- LAYOUT PRIMITIVES ------------------------------------ */
+.row { display: flex; align-items: center; gap: 8px; }
+.col { display: flex; flex-direction: column; gap: 8px; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.spacer { flex: 1 1 auto; }
+.divider { height: 1px; background: var(--separator); }
+.divider-v { width: 1px; background: var(--separator); align-self: stretch; }
+
+/* ---- CARDS ------------------------------------------------ */
+.card {
+  background: var(--bg-elev);
+  border-radius: var(--r-card);
+  overflow: hidden;
+}
+.card-inset {
+  background: var(--bg-elev);
+  border-radius: var(--r-card);
+  margin: 0 16px;
+}
+
+/* ---- BUTTONS ---------------------------------------------- */
+/*
+   iOS button styles:
+   - .btn-filled   — solid tint background, white text (primary action)
+   - .btn-tinted   — translucent tint background, tint text (secondary)
+   - .btn-plain    — no background, tint text (tertiary)
+   - .btn-gray     — translucent gray background (neutral, e.g. Cancel)
+   - .btn-destructive — same as filled but with --danger color
+*/
+button {
+  font-family: inherit;
+  font-size: var(--t-body);
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  color: var(--tint);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-button);
+  padding: 11px 16px;
+  min-height: var(--touch);
+  cursor: pointer;
+  transition: opacity 0.15s ease, background 0.15s ease, transform 0.05s ease;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button:active:not(:disabled) { opacity: 0.55; }
+button:disabled { opacity: 0.30; cursor: not-allowed; }
+
+.btn-filled {
+  background: var(--tint);
+  color: #ffffff;
+}
+.btn-tinted {
+  background: var(--tint-dim);
+  color: var(--tint);
+}
+.btn-plain {
+  background: transparent;
+  color: var(--tint);
+  padding: 11px 8px;
+}
+.btn-gray {
+  background: var(--fill);
+  color: var(--fg);
+}
+.btn-destructive {
+  background: var(--danger);
+  color: #ffffff;
+}
+.btn-warn {
+  background: var(--warn);
+  color: #ffffff;
+}
+.btn-small {
+  font-size: var(--t-subhead);
+  padding: 7px 12px;
+  min-height: 32px;
+}
+
+/* ---- INPUTS ----------------------------------------------- */
+input, select, textarea {
+  font-family: inherit;
+  font-size: var(--t-body);
+  color: var(--fg);
+  background: var(--fill-tertiary);
+  border: none;
+  border-radius: var(--r-control);
+  padding: 9px 12px;
+  min-height: 36px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+input[type=checkbox] {
+  width: 20px; height: 20px;
+  min-height: auto;
+  accent-color: var(--tint);
+}
+select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%238E8E93' stroke-width='1.5' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 32px;
+}
+
+/* ---- LISTS (grouped, inset) ------------------------------- */
+.list-group {
+  background: var(--bg-elev);
+  border-radius: var(--r-card);
+  margin: 0 16px 24px;
+  overflow: hidden;
+}
+.list-group-header {
+  font-size: var(--t-footnote);
+  font-weight: 400;
+  letter-spacing: -0.08px;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  padding: 16px 16px 6px;
+  letter-spacing: 0.06em;
+}
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  min-height: var(--touch);
+  border-bottom: 0.5px solid var(--separator);
+}
+.list-row:last-child { border-bottom: none; }
+.list-row-label { flex: 1; min-width: 0; }
+
+/* ---- STATUS DOT (iOS-style with system colors) ------------ */
+.dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--fg-quaternary);
+  vertical-align: middle;
+}
+.dot.live { background: var(--success); }
+.dot.rec  { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.40; }
+}
+
+/* ---- SCROLLBARS (hidden on iOS anyway, subtle on desktop) - */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--fg-tertiary); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+::selection { background: var(--tint); color: #ffffff; }
