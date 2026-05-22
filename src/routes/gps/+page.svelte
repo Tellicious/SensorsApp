@@ -1,20 +1,29 @@
 <!--
   GPS module page.
 
-  Displays everything from `navigator.geolocation.watchPosition`:
-  - A numeric panel (lat/lon/alt/heading/speed/accuracy)
-  - A Leaflet map with the current position marker and the session track
-  - Mini time-series for speed and altitude
-  - KPIs: distance (Haversine), speed stats, elevation gain, time moving,
-    bearing circular mean, accuracy average
+  Changes vs. the previous revision (user-reported bugs):
+  - Removed the "Satellites" row (the Web API does not expose it).
+  - Removed Gain + / − KPIs (rarely useful in practice).
+  - Renamed "Bearing" → "Heading" everywhere (matches the underlying
+    Geolocation API field name and what the user expected).
+  - Autocenter the map on the first fix.
+  - Accuracy KPI now shows the CURRENT horizontal accuracy, matching
+    the value displayed in the status strip (previously was an average,
+    which inevitably diverged from the live value).
+  - Reset now also clears lastLat/Lon/Alt/lastT, the in-memory track,
+    and the map polyline / marker. Previously these survived a reset
+    so the next fix produced a bogus Haversine jump.
+  - Map provider configurable: Apple MapKit JS (needs token), CartoDB
+    Voyager (free, looks Apple-ish), or OpenStreetMap.
 
-  Leaflet and its CSS are dynamically imported so they're not in the
-  initial bundle — only this page pays for them.
+  KPI snapshot ticker: like the Motion page, we also refresh display
+  values from a 250 ms interval so the UI stays responsive between
+  GPS fixes (Geolocation fires ~1 Hz when moving, less when stationary).
 -->
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { settings } from '$lib/stores/settings';
-  import { pushGps, sessionState } from '$lib/stores/session';
+  import { pushGps } from '$lib/stores/session';
   import { createGpsController, haversine, type GpsSample } from '$lib/sensors/gps';
   import KpiCard from '$lib/components/KpiCard.svelte';
   import TimeChart from '$lib/components/TimeChart.svelte';
@@ -26,39 +35,33 @@
   let error = $state<string | null>(null);
   let cur = $state<GpsSample | null>(null);
 
-  // ---- Buffers for mini-charts ----------------------------------------
+  // ---- Mini-chart buffers ---------------------------------------------
   const CAP = 4096;
   const xs = new Float64Array(CAP);
   const ySpeed = new Float64Array(CAP);
   const yAlt = new Float64Array(CAP);
-  // Bearing — heading values, NaN-broken across 0/360 wraps so uPlot
-  // doesn't draw a vertical line every time the compass crosses north.
-  const yBearing = new Float64Array(CAP);
-  let lastBearingRaw: number | null = null;
+  const yHeading = new Float64Array(CAP);   // NaN-broken at 0/360 wraps
+  let lastHeadingRaw: number | null = null;
   let count = $state(0);
   let t0 = 0;
 
-  // ---- KPI state -------------------------------------------------------
+  // ---- KPI accumulators -----------------------------------------------
   let speedMax = $state(0);
-  let speedMin = $state(Infinity);
+  let speedMin = $state<number>(Infinity);
   let speedSum = 0, speedCount = 0;
   let speedMean = $state(0);
   const speedSamples: number[] = [];
   let speedMedian = $state(0);
-  let distance = $state(0);        // meters
-  let gainPos = $state(0);
-  let gainNeg = $state(0);
+  let distance = $state(0);
   let timeMoving = $state(0);
   let lastT = 0;
   let lastLat: number | null = null, lastLon: number | null = null;
   let lastAlt: number | null = null;
-  // Circular-mean accumulators for bearing
-  let bearingSinSum = 0, bearingCosSum = 0;
-  let bearingMean = $state(0);
-  let accSum = 0, accCount = 0;
-  let accMean = $state(0);
+  // Circular-mean accumulators for heading
+  let headingSinSum = 0, headingCosSum = 0;
+  let headingMean = $state(0);
 
-  // ---- Map -------------------------------------------------------------
+  // ---- Map state -------------------------------------------------------
   let mapEl: HTMLDivElement;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let map: any = null;
@@ -67,65 +70,177 @@
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let track: any = null;
   let trackPts: [number, number][] = [];
+  /** Which map provider is actually active (resolved from settings on init). */
+  let activeProvider = $state<'apple' | 'carto' | 'osm'>('carto');
 
   /**
-   * Lazy-load Leaflet (and its CSS) and instantiate the map.
-   * Centered on Milan by default — replaced on first fix.
+   * Initialize the map with the chosen provider.
+   *
+   * Provider selection:
+   * - 'apple' + token present  → load MapKit JS, init with JWT
+   * - 'apple' + no token       → fall back to 'carto' (and warn in console)
+   * - 'carto'                  → Leaflet + CartoDB Voyager tiles
+   * - 'osm'                    → Leaflet + OpenStreetMap default tiles
+   *
+   * Apple MapKit JS requires a JWT issued from an Apple Developer
+   * account — there is no public/anonymous tier. The user provides the
+   * token in Settings → GPS → MapKit JS token. We do not generate or
+   * refresh tokens here.
    */
   async function initMap() {
     if (!mapEl) return;
+    const provider = $settings.gps.mapProvider;
+    const token = $settings.gps.appleMapsToken.trim();
+
+    if (provider === 'apple' && token) {
+      try {
+        await initAppleMap(token);
+        activeProvider = 'apple';
+        return;
+      } catch (e) {
+        console.warn('MapKit JS init failed, falling back to CartoDB:', e);
+      }
+    } else if (provider === 'apple' && !token) {
+      console.warn('Apple Maps selected but no MapKit JS token set — falling back to CartoDB.');
+    }
+
+    await initLeafletMap(provider === 'osm' ? 'osm' : 'carto');
+    activeProvider = provider === 'osm' ? 'osm' : 'carto';
+  }
+
+  async function initAppleMap(token: string) {
+    // Lazy-load MapKit JS from Apple's CDN
+    if (!('mapkit' in window)) {
+      await new Promise<void>((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.apple-mapkit.com/mk/5.x.x/mapkit.js';
+        s.crossOrigin = 'anonymous';
+        s.dataset.callback = 'initMapKit';
+        s.dataset.initialToken = token;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('MapKit JS failed to load'));
+        document.head.appendChild(s);
+      });
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mapkit = (window as any).mapkit;
+    if (!mapkit) throw new Error('mapkit global missing');
+    if (!mapkit.initialized) {
+      mapkit.init({
+        authorizationCallback: (done: (t: string) => void) => done(token),
+        language: 'en'
+      });
+    }
+    map = new mapkit.Map(mapEl, {
+      center: new mapkit.Coordinate(45.4642, 9.19),
+      cameraDistance: 5000,
+      showsCompass: mapkit.FeatureVisibility.Hidden,
+      showsScale: mapkit.FeatureVisibility.Hidden
+    });
+    track = null; // polyline gets created on first sample
+    marker = null;
+  }
+
+  async function initLeafletMap(kind: 'carto' | 'osm') {
     const L = (await import('leaflet')).default;
     await import('leaflet/dist/leaflet.css');
     map = L.map(mapEl, { attributionControl: false, zoomControl: true }).setView([45.4642, 9.19], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-    track = L.polyline([], { color: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(), weight: 3 }).addTo(map);
+    const tilesUrl = kind === 'carto'
+      ? 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'
+      : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    L.tileLayer(tilesUrl, {
+      maxZoom: 19,
+      subdomains: kind === 'carto' ? 'abcd' : 'abc'
+    }).addTo(map);
+    track = L.polyline([], {
+      color: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
+      weight: 3
+    }).addTo(map);
   }
 
   onMount(() => { if ($settings.gps.showMap) initMap(); });
 
-  /**
-   * Process a geolocation sample: append to buffers, update KPIs,
-   * extend the map track, and stream to the logger.
-   */
+  function extendMap(s: GpsSample, firstFix: boolean) {
+    if (!map) return;
+    trackPts.push([s.lat, s.lon]);
+
+    if (activeProvider === 'apple') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mapkit = (window as any).mapkit;
+      const coord = new mapkit.Coordinate(s.lat, s.lon);
+      if (!track) {
+        track = new mapkit.PolylineOverlay(
+          trackPts.map(([la, lo]) => new mapkit.Coordinate(la, lo)),
+          {
+            style: new mapkit.Style({
+              strokeColor: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
+              lineWidth: 3
+            })
+          }
+        );
+        map.addOverlay(track);
+      } else {
+        track.points = trackPts.map(([la, lo]) => new mapkit.Coordinate(la, lo));
+      }
+      if (!marker) {
+        marker = new mapkit.MarkerAnnotation(coord, {
+          color: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim()
+        });
+        map.addAnnotation(marker);
+      } else {
+        marker.coordinate = coord;
+      }
+      if (firstFix) map.setCenterAnimated(coord, true);
+    } else {
+      track?.setLatLngs(trackPts);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const L = (window as any).L;
+      if (!marker) {
+        marker = L.circleMarker([s.lat, s.lon], {
+          radius: 6,
+          color: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
+          fillColor: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
+          fillOpacity: 0.9
+        }).addTo(map);
+      } else {
+        marker.setLatLng([s.lat, s.lon]);
+      }
+      // Autocenter on first fix — previously was missing, so the user
+      // had to manually tap Center every time.
+      if (firstFix) map.setView([s.lat, s.lon], 16);
+    }
+  }
+
   function onSample(s: GpsSample) {
+    const firstFix = trackPts.length === 0;
     if (t0 === 0) t0 = s.t;
     const tSec = (s.t - t0) / 1000;
     cur = s;
 
+    // Append to mini-chart buffers
     if (count < CAP) {
       xs[count] = tSec;
       ySpeed[count] = s.speed ?? 0;
       yAlt[count] = s.alt ?? 0;
-      // Bearing: insert NaN when the value wraps across 0/360 so uPlot
-      // breaks the line instead of drawing a vertical spike from 359 → 1.
       if (s.heading !== null && !isNaN(s.heading)) {
-        if (lastBearingRaw !== null && Math.abs(s.heading - lastBearingRaw) > 180) {
-          yBearing[count] = NaN;
-        } else {
-          yBearing[count] = s.heading;
-        }
-        lastBearingRaw = s.heading;
-      } else {
-        yBearing[count] = NaN;
-      }
+        yHeading[count] = (lastHeadingRaw !== null && Math.abs(s.heading - lastHeadingRaw) > 180)
+          ? NaN : s.heading;
+        lastHeadingRaw = s.heading;
+      } else { yHeading[count] = NaN; }
       count++;
     } else {
-      xs.copyWithin(0, 1); ySpeed.copyWithin(0, 1); yAlt.copyWithin(0, 1); yBearing.copyWithin(0, 1);
+      xs.copyWithin(0, 1); ySpeed.copyWithin(0, 1);
+      yAlt.copyWithin(0, 1); yHeading.copyWithin(0, 1);
       const i = CAP - 1;
       xs[i] = tSec; ySpeed[i] = s.speed ?? 0; yAlt[i] = s.alt ?? 0;
       if (s.heading !== null && !isNaN(s.heading)) {
-        if (lastBearingRaw !== null && Math.abs(s.heading - lastBearingRaw) > 180) {
-          yBearing[i] = NaN;
-        } else {
-          yBearing[i] = s.heading;
-        }
-        lastBearingRaw = s.heading;
-      } else {
-        yBearing[i] = NaN;
-      }
+        yHeading[i] = (lastHeadingRaw !== null && Math.abs(s.heading - lastHeadingRaw) > 180)
+          ? NaN : s.heading;
+        lastHeadingRaw = s.heading;
+      } else { yHeading[i] = NaN; }
     }
 
-    // Speed stats
+    // KPIs
     if (s.speed !== null) {
       speedMax = Math.max(speedMax, s.speed);
       if (s.speed < speedMin) speedMin = s.speed;
@@ -136,46 +251,22 @@
       const sorted = [...speedSamples].sort((a, b) => a - b);
       speedMedian = sorted[Math.floor(sorted.length / 2)];
     }
-    // Distance (Haversine between consecutive fixes)
-    if (lastLat !== null && lastLon !== null) distance += haversine(lastLat, lastLon, s.lat, s.lon);
-    // Elevation gain / loss
-    if (lastAlt !== null && s.alt !== null) {
-      const dh = s.alt - lastAlt;
-      if (dh > 0) gainPos += dh; else gainNeg -= dh;
+    if (lastLat !== null && lastLon !== null) {
+      distance += haversine(lastLat, lastLon, s.lat, s.lon);
     }
-    // Time moving — accumulate only when above threshold
     if (lastT !== 0 && (s.speed ?? 0) > $settings.gps.movementThresholdMps) {
       timeMoving += (s.t - lastT);
     }
-    // Bearing circular mean
     if (s.heading !== null && !isNaN(s.heading)) {
       const rad = (s.heading * Math.PI) / 180;
-      bearingSinSum += Math.sin(rad);
-      bearingCosSum += Math.cos(rad);
-      const meanRad = Math.atan2(bearingSinSum, bearingCosSum);
-      bearingMean = ((meanRad * 180) / Math.PI + 360) % 360;
+      headingSinSum += Math.sin(rad);
+      headingCosSum += Math.cos(rad);
+      const meanRad = Math.atan2(headingSinSum, headingCosSum);
+      headingMean = ((meanRad * 180) / Math.PI + 360) % 360;
     }
-    if (s.accH !== null) { accSum += s.accH; accCount++; accMean = accSum / accCount; }
     lastT = s.t; lastLat = s.lat; lastLon = s.lon; lastAlt = s.alt;
 
-    // Map: extend track polyline + move marker
-    if (map) {
-      trackPts.push([s.lat, s.lon]);
-      track.setLatLngs(trackPts);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const L = (window as any).L;
-      if (!marker) {
-        // circleMarker — no PNG icon needed, works offline
-        marker = L.circleMarker([s.lat, s.lon], {
-          radius: 6,
-          color: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
-          fillColor: getComputedStyle(document.documentElement).getPropertyValue('--tint').trim(),
-          fillOpacity: 0.9
-        }).addTo(map);
-      } else {
-        marker.setLatLng([s.lat, s.lon]);
-      }
-    }
+    extendMap(s, firstFix);
 
     pushGps({
       t: Math.floor(s.t - t0),
@@ -188,15 +279,7 @@
     if (running) return;
     if (!map && $settings.gps.showMap) initMap();
     error = null;
-    count = 0; t0 = 0; trackPts = [];
-    if (track) track.setLatLngs([]);
-    speedMax = 0; speedMin = Infinity; speedSum = 0; speedCount = 0; speedMean = 0; speedMedian = 0;
-    speedSamples.length = 0;
-    distance = 0; gainPos = 0; gainNeg = 0; timeMoving = 0;
-    bearingSinSum = 0; bearingCosSum = 0; bearingMean = 0;
-    lastBearingRaw = null;
-    accSum = 0; accCount = 0; accMean = 0;
-    lastT = 0; lastLat = null; lastLon = null; lastAlt = null;
+    resetKpi(); // also clears trackPts and map artifacts
     ctrl.start(onSample, (e) => { error = e.message || `Code ${e.code}`; });
     running = true;
   }
@@ -204,28 +287,76 @@
   function stop() { ctrl.stop(); running = false; }
   onDestroy(stop);
 
-  /** Recenter the map on the latest fix. */
   function centerOnMe() {
-    if (cur && map) map.setView([cur.lat, cur.lon], 17);
+    if (!cur || !map) return;
+    if (activeProvider === 'apple') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mapkit = (window as any).mapkit;
+      map.setCenterAnimated(new mapkit.Coordinate(cur.lat, cur.lon), true);
+    } else {
+      map.setView([cur.lat, cur.lon], 17);
+    }
   }
-  /** Zoom map so the entire recorded track fits the viewport. */
   function fitTrack() {
-    if (map && trackPts.length > 1) {
+    if (!map || trackPts.length < 2) return;
+    if (activeProvider === 'apple') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mapkit = (window as any).mapkit;
+      const lats = trackPts.map(p => p[0]);
+      const lons = trackPts.map(p => p[1]);
+      const region = new mapkit.CoordinateRegion(
+        new mapkit.Coordinate((Math.max(...lats) + Math.min(...lats)) / 2, (Math.max(...lons) + Math.min(...lons)) / 2),
+        new mapkit.CoordinateSpan(Math.max(0.001, Math.max(...lats) - Math.min(...lats)) * 1.4,
+                                  Math.max(0.001, Math.max(...lons) - Math.min(...lons)) * 1.4)
+      );
+      map.setRegionAnimated(region, true);
+    } else {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const L = (window as any).L;
       map.fitBounds(L.latLngBounds(trackPts), { padding: [20, 20] });
     }
   }
 
+  /**
+   * Reset all KPI accumulators + position cursors + visible track.
+   *
+   * Previously reset only reset the displayed values but left
+   * lastLat/Lon/Alt populated — so the next sample computed a
+   * Haversine jump from the pre-reset position and the distance
+   * KPI shot up. Now everything is cleared coherently.
+   */
   function resetKpi() {
-    speedMax = 0; speedMin = Infinity; speedSum = 0; speedCount = 0; speedMean = 0; speedMedian = 0;
+    speedMax = 0; speedMin = Infinity;
+    speedSum = 0; speedCount = 0;
+    speedMean = 0; speedMedian = 0;
     speedSamples.length = 0;
-    distance = 0; gainPos = 0; gainNeg = 0; timeMoving = 0;
-    bearingSinSum = 0; bearingCosSum = 0; bearingMean = 0;
-    accSum = 0; accCount = 0; accMean = 0;
+    distance = 0; timeMoving = 0;
+    headingSinSum = 0; headingCosSum = 0; headingMean = 0;
+    lastT = 0; lastLat = null; lastLon = null; lastAlt = null;
+    lastHeadingRaw = null;
+    count = 0; t0 = 0;
+    trackPts = [];
+    // Clear the visual track polyline
+    if (track) {
+      if (activeProvider === 'apple') {
+        track.points = [];
+      } else {
+        track.setLatLngs([]);
+      }
+    }
+    // Clear the position marker
+    if (marker) {
+      if (activeProvider === 'apple' && map) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        try { map.removeAnnotation(marker); } catch { /* */ }
+      } else if (map) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        try { map.removeLayer(marker); } catch { /* */ }
+      }
+      marker = null;
+    }
   }
 
-  /** Format a coordinate either as decimal degrees or DMS depending on settings. */
   function fmtCoord(v: number | null, isLat: boolean): string {
     if (v === null) return '—';
     if ($settings.gps.coordFormat === 'decimal') return v.toFixed(6);
@@ -238,7 +369,6 @@
     return `${d}° ${m}' ${sec.toFixed(2)}" ${hem}`;
   }
 
-  /** Human-friendly duration formatter (1h 23m / 4m 12s / 12s). */
   function fmtDuration(ms: number): string {
     const s = Math.floor(ms / 1000);
     const h = Math.floor(s / 3600);
@@ -246,6 +376,10 @@
     const sec = s % 60;
     return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${sec}s` : `${sec}s`;
   }
+
+  // Current-accuracy display (used in both the status strip and the
+  // Accuracy KPI so they stay consistent)
+  const accCurrent = $derived(cur?.accH ?? null);
 </script>
 
 <div class="page">
@@ -253,13 +387,12 @@
     <span class="dot" class:live={running}></span>
     <span class="subhead">
       {running ? 'Acquiring' : 'Idle'}
-      {#if cur} · acc {cur.accH?.toFixed(0) ?? '—'} m{/if}
+      {#if cur} · acc {accCurrent?.toFixed(0) ?? '—'} m{/if}
     </span>
   </div>
 
   {#if error}<div class="banner danger">{error}</div>{/if}
 
-  <!-- COORDINATES -->
   <p class="section-header">Position</p>
   <section class="list-group">
     <div class="list-row">
@@ -288,70 +421,44 @@
       <span class="list-row-label footnote">Accuracy (V)</span>
       <span class="value-mono">{fmtAltitude(cur?.accV ?? null, $settings.global.units)}</span>
     </div>
-    <div class="list-row">
-      <span class="list-row-label footnote">Satellites</span>
-      <span class="value-mono footnote">N/A · not exposed by Web API</span>
-    </div>
   </section>
 
   <!-- KPI -->
   <p class="section-header">Trip stats</p>
   <section class="kpi-grid">
-    <KpiCard
-      label="Distance"
-      value={fmtDistance(distance, $settings.global.units)}
-      onReset={resetKpi}
-      big accent
-    />
-    <KpiCard
-      label="Speed max"
-      value={convert(speedMax, 'speed', $settings.global.units)}
-      unit={unitLabel('speed', $settings.global.units)}
-      onReset={() => speedMax = 0}
-    />
-    <KpiCard
-      label="Speed min"
-      value={isFinite(speedMin) ? convert(speedMin, 'speed', $settings.global.units) : 0}
-      unit={unitLabel('speed', $settings.global.units)}
-      onReset={() => speedMin = Infinity}
-    />
-    <KpiCard
-      label="Speed avg"
-      value={convert(speedMean, 'speed', $settings.global.units)}
-      unit={unitLabel('speed', $settings.global.units)}
-      onReset={resetKpi}
-    />
-    <KpiCard
-      label="Median spd"
-      value={convert(speedMedian, 'speed', $settings.global.units)}
-      unit={unitLabel('speed', $settings.global.units)}
-      onReset={resetKpi}
-    />
-    <KpiCard
-      label="Gain +"
-      value={convert(gainPos, 'altitude', $settings.global.units)}
-      unit={unitLabel('altitude', $settings.global.units)}
-      onReset={() => gainPos = 0}
-    />
-    <KpiCard
-      label="Gain −"
-      value={convert(gainNeg, 'altitude', $settings.global.units)}
-      unit={unitLabel('altitude', $settings.global.units)}
-      onReset={() => gainNeg = 0}
-    />
-    <KpiCard label="Moving" value={fmtDuration(timeMoving)} onReset={() => timeMoving = 0} />
-    <KpiCard label="Bearing avg" value={bearingMean} unit="°" onReset={resetKpi} />
-    <KpiCard
-      label="Acc avg"
-      value={convert(accMean, 'altitude', $settings.global.units)}
-      unit={unitLabel('altitude', $settings.global.units)}
-      onReset={resetKpi}
-    />
+    {#if $settings.gps.kpiVisible.distance}
+      <KpiCard label="Distance" value={fmtDistance(distance, $settings.global.units)} onReset={resetKpi} big accent />
+    {/if}
+    {#if $settings.gps.kpiVisible.speedMax}
+      <KpiCard label="Speed max" value={convert(speedMax, 'speed', $settings.global.units)} unit={unitLabel('speed', $settings.global.units)} onReset={() => speedMax = 0} />
+    {/if}
+    {#if $settings.gps.kpiVisible.speedMin}
+      <KpiCard label="Speed min" value={isFinite(speedMin) ? convert(speedMin, 'speed', $settings.global.units) : 0} unit={unitLabel('speed', $settings.global.units)} onReset={() => speedMin = Infinity} />
+    {/if}
+    {#if $settings.gps.kpiVisible.speedAvg}
+      <KpiCard label="Speed avg" value={convert(speedMean, 'speed', $settings.global.units)} unit={unitLabel('speed', $settings.global.units)} onReset={resetKpi} />
+    {/if}
+    {#if $settings.gps.kpiVisible.speedMedian}
+      <KpiCard label="Median spd" value={convert(speedMedian, 'speed', $settings.global.units)} unit={unitLabel('speed', $settings.global.units)} onReset={resetKpi} />
+    {/if}
+    {#if $settings.gps.kpiVisible.timeMoving}
+      <KpiCard label="Moving" value={fmtDuration(timeMoving)} onReset={() => timeMoving = 0} />
+    {/if}
+    {#if $settings.gps.kpiVisible.heading}
+      <KpiCard label="Heading avg" value={headingMean} unit="°" onReset={resetKpi} />
+    {/if}
+    {#if $settings.gps.kpiVisible.accuracy}
+      <KpiCard
+        label="Accuracy"
+        value={accCurrent !== null ? convert(accCurrent, 'altitude', $settings.global.units) : 0}
+        unit={unitLabel('altitude', $settings.global.units)}
+        onReset={resetKpi}
+      />
+    {/if}
   </section>
 
-  <!-- MAP -->
   {#if $settings.gps.showMap}
-    <p class="section-header">Map</p>
+    <p class="section-header">Map · {activeProvider === 'apple' ? 'Apple Maps' : activeProvider === 'carto' ? 'CartoDB Voyager' : 'OpenStreetMap'}</p>
     <section class="card chart-card">
       <div class="card-head">
         <span class="headline">Track</span>
@@ -363,7 +470,6 @@
     </section>
   {/if}
 
-  <!-- CHARTS -->
   {#if $settings.gps.showTimeCharts}
     <p class="section-header">Speed over time</p>
     <section class="card chart-card">
@@ -391,17 +497,12 @@
       </div>
     </section>
 
-    <p class="section-header">Bearing over time</p>
+    <p class="section-header">Heading over time</p>
     <section class="card chart-card">
       <div class="chart-host" style="height: 140px">
-        <!--
-          Bearing wraps across 0/360. We insert NaN at wrap points in the
-          buffer (see onSample) so uPlot breaks the line instead of drawing
-          a vertical spike from 359° to 1°. Y axis is fixed 0..360.
-        -->
         <TimeChart
-          {xs} ys={[yBearing]}
-          seriesDefs={[{ label: 'bearing', color: 'var(--series-3)' }]}
+          {xs} ys={[yHeading]}
+          seriesDefs={[{ label: 'heading', color: 'var(--series-3)' }]}
           {count}
           windowSec={Math.max(60, count > 0 ? xs[count-1] : 60)}
           yMin={0} yMax={360}
@@ -420,11 +521,9 @@
     overflow-y: auto;
     padding: 8px 0 12px;
     background: var(--bg-grouped);
+    -webkit-overflow-scrolling: touch;
   }
-  .status-strip {
-    display: flex; align-items: center; gap: 8px;
-    padding: 0 16px 12px;
-  }
+  .status-strip { display: flex; align-items: center; gap: 8px; padding: 0 16px 12px; }
   .banner {
     margin: 8px 16px;
     padding: 12px 16px;

@@ -1,18 +1,24 @@
 <!--
   Settings page.
 
-  Exposes every field in AllSettings, plus storage management and
-  backup/restore. Laid out as iOS grouped lists — uppercase section
-  header above each card, rows of label + control, separators between
-  rows. Buttons follow iOS conventions: filled for affirmative,
-  destructive (red) for wipe/reset, plain link-style for navigations.
+  Layout follows iOS grouped-list convention. Native checkboxes have been
+  replaced with iOS-style toggle switches wrapped in <label> elements so
+  the entire row becomes the touch target. On iOS Safari the native
+  checkbox is tiny (~16 pt), hard to tap, and `onchange` sometimes
+  doesn't fire on the first touch — wrapping in a label and using a
+  custom switch resolves both issues.
+
+  New: per-KPI visibility for Motion / Audio / GPS (so the page can stay
+  focused on the metrics the user cares about, while inline controls
+  on each page handle which CHART axes are visible).
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
     settings, resetSettings, exportSettingsJson, importSettingsJson,
     updateGlobal, updateMotion, updateAudio, updateGps,
-    type Theme, type CoordFormat
+    setMotionKpi, setAudioKpi, setGpsKpi,
+    type Theme, type CoordFormat, type MapProvider
   } from '$lib/stores/settings';
   import { FFT_SIZES } from '$lib/dsp/fft';
   import { WINDOW_NAMES, type WindowName } from '$lib/dsp/windowing';
@@ -26,14 +32,12 @@
   let importTextarea = $state('');
   let importError = $state<string | null>(null);
 
-  /** Refresh the storage quota/usage display. */
   async function refreshStorage() {
     usage = await estimateUsage();
     sessionCount = await db.sessions.count();
   }
   onMount(refreshStorage);
 
-  /** Human-friendly byte-size formatter. */
   function fmtBytes(b: number): string {
     if (b < 1024) return `${b} B`;
     if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
@@ -41,7 +45,6 @@
     return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
   }
 
-  /** Copy settings JSON to clipboard AND prefill the import box (round-trip test). */
   function copyJson() {
     const json = exportSettingsJson();
     navigator.clipboard?.writeText(json);
@@ -58,7 +61,6 @@
     }
   }
 
-  /** Download settings JSON as a file. */
   async function downloadJson() {
     const blob = new Blob([exportSettingsJson()], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -87,127 +89,235 @@
   <!-- GLOBAL -->
   <p class="section-header">General</p>
   <section class="list-group">
-    <div class="list-row">
+    <label class="list-row">
       <span class="list-row-label">Theme</span>
       <select value={$settings.global.theme} onchange={(e) => updateGlobal({ theme: (e.currentTarget as HTMLSelectElement).value as Theme })}>
         <option value="auto">Automatic</option>
         <option value="dark">Dark</option>
         <option value="light">Light</option>
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Keep screen awake</span>
-      <input type="checkbox" checked={$settings.global.wakeLock} onchange={(e) => updateGlobal({ wakeLock: (e.currentTarget as HTMLInputElement).checked })} />
-    </div>
-    <div class="list-row">
+      <span class="ios-toggle" class:on={$settings.global.wakeLock}>
+        <input type="checkbox" checked={$settings.global.wakeLock} onchange={(e) => updateGlobal({ wakeLock: (e.currentTarget as HTMLInputElement).checked })} />
+        <span class="track"></span><span class="knob"></span>
+      </span>
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Units</span>
       <select value={$settings.global.units} onchange={(e) => updateGlobal({ units: (e.currentTarget as HTMLSelectElement).value as 'si' | 'imperial' })}>
         <option value="si">Metric (SI)</option>
         <option value="imperial">Imperial</option>
       </select>
-    </div>
+    </label>
   </section>
 
-  <!-- MOTION -->
+  <!-- MOTION channels -->
   <p class="section-header">Motion · channels</p>
   <section class="list-group">
-    <div class="list-row"><span class="list-row-label">Show linear acceleration</span><input type="checkbox" checked={$settings.motion.showLinear} onchange={(e) => updateMotion({ showLinear: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Show raw (with gravity)</span><input type="checkbox" checked={$settings.motion.showRaw} onchange={(e) => updateMotion({ showRaw: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Show gyroscope</span><input type="checkbox" checked={$settings.motion.showGyro} onchange={(e) => updateMotion({ showGyro: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Show orientation</span><input type="checkbox" checked={$settings.motion.showOrientation} onchange={(e) => updateMotion({ showOrientation: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Show magnitude |a|</span><input type="checkbox" checked={$settings.motion.showMagnitude} onchange={(e) => updateMotion({ showMagnitude: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Axis X</span><input type="checkbox" checked={$settings.motion.axisX} onchange={(e) => updateMotion({ axisX: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Axis Y</span><input type="checkbox" checked={$settings.motion.axisY} onchange={(e) => updateMotion({ axisY: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Axis Z</span><input type="checkbox" checked={$settings.motion.axisZ} onchange={(e) => updateMotion({ axisZ: (e.currentTarget as HTMLInputElement).checked })} /></div>
+    {#each [
+      { k: 'showLinear', l: 'Show linear acceleration' },
+      { k: 'showRaw', l: 'Show raw (with gravity)' },
+      { k: 'showGyro', l: 'Show gyroscope' },
+      { k: 'showOrientation', l: 'Show orientation' },
+      { k: 'showMagnitude', l: 'Show magnitude |a|' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.motion as Record<string, unknown>)[t.k] as boolean}>
+          <input
+            type="checkbox"
+            checked={($settings.motion as Record<string, unknown>)[t.k] as boolean}
+            onchange={(e) => updateMotion({ [t.k]: (e.currentTarget as HTMLInputElement).checked } as never)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
   </section>
 
+  <!-- MOTION KPI visibility -->
+  <p class="section-header">Motion · KPI visibility</p>
+  <section class="list-group">
+    {#each [
+      { k: 'peak', l: 'Peak' },
+      { k: 'rms', l: 'RMS' },
+      { k: 'avg', l: 'Avg' },
+      { k: 'crest', l: 'Crest factor' },
+      { k: 'kurt', l: 'Kurtosis' },
+      { k: 'hold', l: 'Peak-hold' },
+      { k: 'pkpk', l: 'Peak-to-peak' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.motion.kpiVisible as Record<string, boolean>)[t.k]}>
+          <input
+            type="checkbox"
+            checked={($settings.motion.kpiVisible as Record<string, boolean>)[t.k]}
+            onchange={(e) => setMotionKpi(t.k as never, (e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
+  </section>
+
+  <!-- MOTION FFT -->
   <p class="section-header">Motion · FFT</p>
   <section class="list-group">
-    <div class="list-row">
+    <label class="list-row">
       <span class="list-row-label">Size</span>
       <select value={$settings.motion.fftSize} onchange={(e) => updateMotion({ fftSize: +(e.currentTarget as HTMLSelectElement).value as typeof FFT_SIZES[number] })}>
         {#each FFT_SIZES.filter(s => s <= 4096) as s}<option value={s}>{s}</option>{/each}
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Window</span>
       <select value={$settings.motion.fftWindow} onchange={(e) => updateMotion({ fftWindow: (e.currentTarget as HTMLSelectElement).value as WindowName })}>
         {#each WINDOW_NAMES as w}<option value={w}>{w}</option>{/each}
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Overlap</span>
       <select value={$settings.motion.fftOverlapPct} onchange={(e) => updateMotion({ fftOverlapPct: +(e.currentTarget as HTMLSelectElement).value as 0 | 25 | 50 | 75 })}>
         {#each [0, 25, 50, 75] as o}<option value={o}>{o}%</option>{/each}
       </select>
-    </div>
-    <div class="list-row"><span class="list-row-label">Y log (dB)</span><input type="checkbox" checked={$settings.motion.fftScaleLog} onchange={(e) => updateMotion({ fftScaleLog: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">X log frequency</span><input type="checkbox" checked={$settings.motion.fftFreqLog} onchange={(e) => updateMotion({ fftFreqLog: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Auto-scale Y</span><input type="checkbox" checked={$settings.motion.fftAutoScale} onchange={(e) => updateMotion({ fftAutoScale: (e.currentTarget as HTMLInputElement).checked })} /></div>
+    </label>
+    {#each [
+      { k: 'fftScaleLog', l: 'Y log (dB)' },
+      { k: 'fftFreqLog', l: 'X log frequency' },
+      { k: 'fftAutoScale', l: 'Auto-scale Y' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.motion as Record<string, unknown>)[t.k] as boolean}>
+          <input
+            type="checkbox"
+            checked={($settings.motion as Record<string, unknown>)[t.k] as boolean}
+            onchange={(e) => updateMotion({ [t.k]: (e.currentTarget as HTMLInputElement).checked } as never)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
   </section>
 
+  <!-- MOTION KPI windows -->
   <p class="section-header">Motion · KPI windows</p>
   <section class="list-group">
-    <div class="list-row">
+    <label class="list-row">
       <span class="list-row-label">RMS window</span>
       <input type="number" step="0.1" min="0.1" max="60" value={$settings.motion.rmsWindowSec} oninput={(e) => updateMotion({ rmsWindowSec: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
       <span class="footnote">s</span>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Average window</span>
       <input type="number" step="0.5" min="0.5" max="60" value={$settings.motion.meanWindowSec} oninput={(e) => updateMotion({ meanWindowSec: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
       <span class="footnote">s</span>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Peak-hold decay</span>
       <input type="number" step="0.1" min="0" max="20" value={$settings.motion.peakHoldDecayDbPerSec} oninput={(e) => updateMotion({ peakHoldDecayDbPerSec: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
       <span class="footnote">dB/s</span>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Dominant freq count</span>
       <input type="number" step="1" min="1" max="20" value={$settings.motion.dominantFreqCount} oninput={(e) => updateMotion({ dominantFreqCount: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
-    </div>
+    </label>
+    <label class="list-row">
+      <span class="list-row-label">Dominant smoothing</span>
+      <input type="number" step="0.05" min="0" max="0.99" value={$settings.motion.dominantSmoothing} oninput={(e) => updateMotion({ dominantSmoothing: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
+    </label>
   </section>
 
-  <!-- AUDIO -->
+  <!-- AUDIO display -->
   <p class="section-header">Audio · display</p>
   <section class="list-group">
-    <div class="list-row"><span class="list-row-label">Waveform</span><input type="checkbox" checked={$settings.audio.showWaveform} onchange={(e) => updateAudio({ showWaveform: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Spectrum</span><input type="checkbox" checked={$settings.audio.showSpectrum} onchange={(e) => updateAudio({ showSpectrum: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Spectrogram</span><input type="checkbox" checked={$settings.audio.showSpectrogram} onchange={(e) => updateAudio({ showSpectrogram: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row">
+    {#each [
+      { k: 'showWaveform', l: 'Waveform' },
+      { k: 'showSpectrum', l: 'Spectrum' },
+      { k: 'showSpectrogram', l: 'Spectrogram' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.audio as Record<string, unknown>)[t.k] as boolean}>
+          <input
+            type="checkbox"
+            checked={($settings.audio as Record<string, unknown>)[t.k] as boolean}
+            onchange={(e) => updateAudio({ [t.k]: (e.currentTarget as HTMLInputElement).checked } as never)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
+    <label class="list-row">
       <span class="list-row-label">Waveform window</span>
       <select value={$settings.audio.waveformWindowMs} onchange={(e) => updateAudio({ waveformWindowMs: +(e.currentTarget as HTMLSelectElement).value as 50 | 100 | 500 | 1000 })}>
         {#each [50, 100, 500, 1000] as w}<option value={w}>{w}ms</option>{/each}
       </select>
-    </div>
+    </label>
   </section>
 
+  <!-- AUDIO KPI visibility -->
+  <p class="section-header">Audio · KPI visibility</p>
+  <section class="list-group">
+    {#each [
+      { k: 'peak', l: 'Peak' },
+      { k: 'rms', l: 'RMS / Leq' },
+      { k: 'crest', l: 'Crest factor' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.audio.kpiVisible as Record<string, boolean>)[t.k]}>
+          <input
+            type="checkbox"
+            checked={($settings.audio.kpiVisible as Record<string, boolean>)[t.k]}
+            onchange={(e) => setAudioKpi(t.k as never, (e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
+  </section>
+
+  <!-- AUDIO FFT -->
   <p class="section-header">Audio · FFT &amp; weighting</p>
   <section class="list-group">
-    <div class="list-row">
+    <label class="list-row">
       <span class="list-row-label">Size</span>
       <select value={$settings.audio.fftSize} onchange={(e) => updateAudio({ fftSize: +(e.currentTarget as HTMLSelectElement).value as typeof FFT_SIZES[number] })}>
         {#each FFT_SIZES as s}<option value={s}>{s}</option>{/each}
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Window</span>
       <select value={$settings.audio.fftWindow} onchange={(e) => updateAudio({ fftWindow: (e.currentTarget as HTMLSelectElement).value as WindowName })}>
         {#each WINDOW_NAMES as w}<option value={w}>{w}</option>{/each}
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Weighting</span>
       <select value={$settings.audio.weighting} onchange={(e) => updateAudio({ weighting: (e.currentTarget as HTMLSelectElement).value as 'Z' | 'A' | 'C' })}>
         <option value="Z">Z (flat)</option>
         <option value="A">A</option>
         <option value="C">C</option>
       </select>
-    </div>
-    <div class="list-row"><span class="list-row-label">X log frequency</span><input type="checkbox" checked={$settings.audio.fftFreqLog} onchange={(e) => updateAudio({ fftFreqLog: (e.currentTarget as HTMLInputElement).checked })} /></div>
+    </label>
+    <label class="list-row">
+      <span class="list-row-label">X log frequency</span>
+      <span class="ios-toggle" class:on={$settings.audio.fftFreqLog}>
+        <input type="checkbox" checked={$settings.audio.fftFreqLog} onchange={(e) => updateAudio({ fftFreqLog: (e.currentTarget as HTMLInputElement).checked })} />
+        <span class="track"></span><span class="knob"></span>
+      </span>
+    </label>
+    <label class="list-row">
+      <span class="list-row-label">Dominant smoothing</span>
+      <input type="number" step="0.05" min="0" max="0.99" value={$settings.audio.dominantSmoothing} oninput={(e) => updateAudio({ dominantSmoothing: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
+    </label>
   </section>
 
+  <!-- AUDIO calibration -->
   <p class="section-header">Audio · microphone calibration</p>
   <section class="list-group">
     <div class="list-row" style="padding-top: 14px; padding-bottom: 14px">
@@ -237,20 +347,84 @@
   <!-- GPS -->
   <p class="section-header">GPS</p>
   <section class="list-group">
-    <div class="list-row">
+    <label class="list-row">
       <span class="list-row-label">Coordinate format</span>
       <select value={$settings.gps.coordFormat} onchange={(e) => updateGps({ coordFormat: (e.currentTarget as HTMLSelectElement).value as CoordFormat })}>
         <option value="decimal">Decimal</option>
         <option value="dms">DMS</option>
       </select>
-    </div>
-    <div class="list-row">
+    </label>
+    <label class="list-row">
       <span class="list-row-label">Movement threshold</span>
       <input type="number" step="0.1" min="0" max="10" value={$settings.gps.movementThresholdMps} oninput={(e) => updateGps({ movementThresholdMps: +(e.currentTarget as HTMLInputElement).value })} style="width: 80px; text-align: right" />
       <span class="footnote">m/s</span>
+    </label>
+    {#each [
+      { k: 'showMap', l: 'Show map' },
+      { k: 'showTimeCharts', l: 'Show mini charts' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.gps as Record<string, unknown>)[t.k] as boolean}>
+          <input
+            type="checkbox"
+            checked={($settings.gps as Record<string, unknown>)[t.k] as boolean}
+            onchange={(e) => updateGps({ [t.k]: (e.currentTarget as HTMLInputElement).checked } as never)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
+  </section>
+
+  <!-- GPS map provider -->
+  <p class="section-header">GPS · map provider</p>
+  <section class="list-group">
+    <label class="list-row">
+      <span class="list-row-label">Provider</span>
+      <select value={$settings.gps.mapProvider} onchange={(e) => updateGps({ mapProvider: (e.currentTarget as HTMLSelectElement).value as MapProvider })}>
+        <option value="apple">Apple Maps (MapKit JS)</option>
+        <option value="carto">CartoDB Voyager</option>
+        <option value="osm">OpenStreetMap</option>
+      </select>
+    </label>
+    <label class="list-row">
+      <span class="list-row-label">MapKit JS token</span>
+      <input type="text" value={$settings.gps.appleMapsToken} oninput={(e) => updateGps({ appleMapsToken: (e.currentTarget as HTMLInputElement).value })} placeholder="JWT — required for Apple Maps" style="flex: 1; min-width: 0; font-family: var(--mono); font-size: var(--t-footnote)" />
+    </label>
+    <div class="list-row footnote" style="display: block; line-height: 1.45; color: var(--fg-tertiary)">
+      Apple Maps web (MapKit JS) requires a signed JWT issued from your Apple
+      Developer account — there is no public/anonymous tier. If no token is
+      provided, the map falls back to CartoDB Voyager which is free and visually
+      closer to Apple Maps than the default OSM tiles.
     </div>
-    <div class="list-row"><span class="list-row-label">Show map</span><input type="checkbox" checked={$settings.gps.showMap} onchange={(e) => updateGps({ showMap: (e.currentTarget as HTMLInputElement).checked })} /></div>
-    <div class="list-row"><span class="list-row-label">Show mini charts</span><input type="checkbox" checked={$settings.gps.showTimeCharts} onchange={(e) => updateGps({ showTimeCharts: (e.currentTarget as HTMLInputElement).checked })} /></div>
+  </section>
+
+  <!-- GPS KPI visibility -->
+  <p class="section-header">GPS · KPI visibility</p>
+  <section class="list-group">
+    {#each [
+      { k: 'distance', l: 'Distance' },
+      { k: 'speedMax', l: 'Speed max' },
+      { k: 'speedMin', l: 'Speed min' },
+      { k: 'speedAvg', l: 'Speed avg' },
+      { k: 'speedMedian', l: 'Speed median' },
+      { k: 'timeMoving', l: 'Time moving' },
+      { k: 'heading', l: 'Heading' },
+      { k: 'accuracy', l: 'Accuracy' }
+    ] as t}
+      <label class="list-row">
+        <span class="list-row-label">{t.l}</span>
+        <span class="ios-toggle" class:on={($settings.gps.kpiVisible as Record<string, boolean>)[t.k]}>
+          <input
+            type="checkbox"
+            checked={($settings.gps.kpiVisible as Record<string, boolean>)[t.k]}
+            onchange={(e) => setGpsKpi(t.k as never, (e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="track"></span><span class="knob"></span>
+        </span>
+      </label>
+    {/each}
   </section>
 
   <!-- STORAGE -->
@@ -292,11 +466,7 @@
 
   <section class="list-group" style="padding: 14px 16px">
     <span class="footnote">Paste a previously-exported JSON to restore settings</span>
-    <textarea
-      bind:value={importTextarea}
-      placeholder="Paste exported settings JSON here"
-      rows="5"
-    ></textarea>
+    <textarea bind:value={importTextarea} placeholder="Paste exported settings JSON here" rows="5"></textarea>
     <button class="btn-filled" onclick={doImport} disabled={!importTextarea.trim()} style="margin-top: 8px; width: 100%">
       Apply import
     </button>
@@ -305,7 +475,7 @@
     {/if}
   </section>
 
-  <p class="footnote" style="text-align: center; padding: 16px">Sensor Lab · v0.1.0 · offline PWA</p>
+  <p class="footnote" style="text-align: center; padding: 16px">Sensor Lab · v0.2.0 · offline PWA</p>
 </div>
 
 {#if showCalWizard}
@@ -318,6 +488,7 @@
     overflow-y: auto;
     padding: 8px 0 12px;
     background: var(--bg-grouped);
+    -webkit-overflow-scrolling: touch;
   }
   .section-header {
     font-size: var(--t-footnote);
@@ -326,6 +497,11 @@
     letter-spacing: 0.05em;
     margin: 16px 16px 6px 20px;
     font-weight: 400;
+  }
+  .list-row {
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .plain-row {
     width: 100%;
@@ -368,4 +544,45 @@
     font-size: var(--t-footnote);
     resize: vertical;
   }
+
+  /* iOS-style toggle switch. The native input is visually hidden but
+     remains accessible to assistive tech / keyboard. The track/knob
+     are styled via :checked sibling selectors so a click on either the
+     wrapping <label> row OR the input itself flips state correctly. */
+  .ios-toggle {
+    position: relative;
+    display: inline-block;
+    width: 51px;
+    height: 31px;
+    flex-shrink: 0;
+  }
+  .ios-toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    cursor: pointer;
+    z-index: 2;
+  }
+  .ios-toggle .track {
+    position: absolute;
+    inset: 0;
+    background: var(--fill);
+    border-radius: 31px;
+    transition: background 0.18s ease;
+  }
+  .ios-toggle .knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 27px;
+    height: 27px;
+    background: #ffffff;
+    border-radius: 50%;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    transition: transform 0.18s ease;
+  }
+  .ios-toggle.on .track { background: var(--success); }
+  .ios-toggle.on .knob { transform: translateX(20px); }
 </style>

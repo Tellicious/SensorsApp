@@ -1,191 +1,212 @@
 <!--
-  TimeChart
-  =========
-  Scrolling time-series chart based on uPlot. Hosts one or more series
-  drawn against a shared X axis (seconds, relative to acquisition start).
+  Inline time-series chart powered by uPlot.
 
-  Inputs are pre-allocated typed arrays whose contents are mutated by the
-  parent at sensor rate; the chart only reads them on its RAF tick and
-  passes slices [0..count) to uPlot. Throttled to ~30 fps.
+  Features:
+  - Auto-follows the head of the data (last `windowSec` of x).
+  - Inline HTML legend (top-right) — the uPlot built-in legend is
+    suppressed because it breaks layout on narrow phone widths.
+  - "Fullscreen" affordance: when `fullscreenTitle` is supplied, a
+    small ⛶ button in the top-right opens the ChartFullscreen overlay,
+    which mounts a second uPlot instance with touch-driven pan / zoom.
+    Both instances read from the same Float64 buffer references so the
+    fullscreen view is live too.
 
-  CSS-variable color values can't be used directly in canvas, so we
-  resolve them once at mount via getComputedStyle.
-
-  Inline legend: a small floating chip cluster in the top-right corner
-  shows one dot+label per series. Pointer-events disabled so it doesn't
-  intercept chart interaction.
+  Buffers are mutated in place by the parent; the RAF reader picks up
+  the latest values each frame without Svelte reactivity getting
+  involved. This is also how the audio waveform now stays live (see
+  the audio page's `timeBufF64` for the matching pre-allocated buffer).
 -->
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
+  import ChartFullscreen from './ChartFullscreen.svelte';
 
-  interface SeriesDef { label: string; color: string }
-
+  interface SeriesDef { label: string; color: string; }
   interface Props {
     xs: Float64Array;
     ys: Float64Array[];
     seriesDefs: SeriesDef[];
     count: number;
     windowSec: number;
-    yMin?: number | null;
-    yMax?: number | null;
+    yMin?: number;
+    yMax?: number;
     yLabel?: string;
+    xLabel?: string;
+    fullscreenTitle?: string;
   }
-
   let {
     xs, ys, seriesDefs, count, windowSec,
-    yMin = null, yMax = null, yLabel = ''
+    yMin, yMax, yLabel = '', xLabel = 's',
+    fullscreenTitle = ''
   }: Props = $props();
 
-  let container: HTMLDivElement;
+  let host: HTMLDivElement;
   let plot: uPlot | null = null;
-  let frame = 0;
+  let rafId = 0;
+  let showFull = $state(false);
 
-  function resolveColor(value: string): string {
-    if (!value.startsWith('var(')) return value;
-    const name = value.slice(4, -1).trim();
+  function resolveColor(c: string): string {
+    if (!c.startsWith('var(')) return c;
+    const name = c.slice(4, -1).trim();
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
   }
+  // Resolved colors for the inline legend (Svelte template can't call functions
+  // that depend on the DOM during SSR, so we compute them on mount)
+  let resolvedColors = $state<string[]>([]);
 
-  /** Resolved colors (literal hex) for the inline legend dots. */
-  let resolvedColors = $derived(seriesDefs.map((s) => resolveColor(s.color)));
-
-  function makeOpts(w: number, h: number): uPlot.Options {
-    const axisColor = resolveColor('var(--fg-secondary)');
-    const gridColor = resolveColor('var(--grid)');
-    const tickColor = resolveColor('var(--separator)');
-    return {
-      width: w,
-      height: h,
-      pxAlign: 0,
-      cursor: { show: false },
-      legend: { show: false },   // we render our own HTML legend overlay
-      scales: {
-        x: { time: false, auto: false },
-        y: { auto: yMin === null || yMax === null }
-      },
-      axes: [
-        {
-          stroke: axisColor,
-          grid: { stroke: gridColor, width: 1 },
-          ticks: { stroke: tickColor, width: 1 },
-          values: (_u, splits) => splits.map((v) => v.toFixed(1) + 's')
-        },
-        {
-          stroke: axisColor,
-          grid: { stroke: gridColor, width: 1 },
-          ticks: { stroke: tickColor, width: 1 },
-          label: yLabel,
-          labelGap: 4,
-          labelSize: 14
-        }
-      ],
-      series: [
-        {},
-        ...seriesDefs.map((s) => ({
-          label: s.label,
-          stroke: resolveColor(s.color),
-          width: 1.5,
-          points: { show: false }
-        }))
-      ]
-    };
+  function buildSeries(): uPlot.Series[] {
+    const arr: uPlot.Series[] = [{}];
+    for (const def of seriesDefs) {
+      arr.push({
+        label: def.label,
+        stroke: resolveColor(def.color),
+        width: 1.4,
+        spanGaps: false
+      });
+    }
+    return arr;
   }
 
   function buildData(): uPlot.AlignedData {
-    if (count === 0) {
-      return [new Float64Array(1), ...ys.map(() => new Float64Array(1))] as unknown as uPlot.AlignedData;
-    }
-    return [xs.subarray(0, count), ...ys.map((y) => y.subarray(0, count))] as unknown as uPlot.AlignedData;
+    const n = Math.min(count, xs.length);
+    const x = xs.subarray(0, n);
+    const data: uPlot.AlignedData = [Array.from(x) as number[]];
+    for (const y of ys) data.push(Array.from(y.subarray(0, n)) as number[]);
+    return data;
+  }
+
+  function autoFollow() {
+    if (!plot) return;
+    const n = Math.min(count, xs.length);
+    if (n < 2) return;
+    const tEnd = xs[n - 1];
+    plot.setScale('x', { min: Math.max(0, tEnd - windowSec), max: tEnd });
+  }
+
+  function mount() {
+    if (!host) return;
+    const tickColor  = getComputedStyle(document.documentElement).getPropertyValue('--separator').trim();
+    const labelColor = getComputedStyle(document.documentElement).getPropertyValue('--fg-tertiary').trim();
+
+    resolvedColors = seriesDefs.map(d => resolveColor(d.color));
+
+    const opts: uPlot.Options = {
+      width: host.clientWidth,
+      height: host.clientHeight,
+      legend: { show: false },
+      cursor: { drag: { x: false, y: false }, points: { show: false } },
+      scales: {
+        x: { time: false },
+        y: {
+          auto: yMin === undefined && yMax === undefined,
+          range: (yMin !== undefined && yMax !== undefined) ? [yMin, yMax] : undefined
+        }
+      },
+      axes: [
+        { stroke: labelColor, grid: { stroke: tickColor, width: 0.5 }, ticks: { stroke: tickColor }, label: xLabel },
+        { stroke: labelColor, grid: { stroke: tickColor, width: 0.5 }, ticks: { stroke: tickColor }, label: yLabel }
+      ],
+      series: buildSeries()
+    };
+    plot = new uPlot(opts, buildData(), host);
+    autoFollow();
+  }
+
+  function refresh() {
+    if (!plot) return;
+    plot.setData(buildData(), false);
+    autoFollow();
+    rafId = requestAnimationFrame(refresh);
+  }
+
+  function onResize() {
+    if (!plot || !host) return;
+    plot.setSize({ width: host.clientWidth, height: host.clientHeight });
   }
 
   onMount(() => {
-    plot = new uPlot(makeOpts(container.clientWidth, container.clientHeight), buildData(), container);
-
-    const ro = new ResizeObserver(() => {
-      if (!plot) return;
-      plot.setSize({ width: container.clientWidth, height: container.clientHeight });
-    });
-    ro.observe(container);
-
-    let last = 0;
-    const loop = (t: number) => {
-      frame = requestAnimationFrame(loop);
-      if (t - last < 33) return;
-      last = t;
-      if (!plot || count === 0) return;
-      const xMax = xs[count - 1];
-      const xMin = Math.max(0, xMax - windowSec);
-      plot.setData(buildData(), false);
-      plot.setScale('x', { min: xMin, max: xMax });
-      if (yMin !== null && yMax !== null) plot.setScale('y', { min: yMin, max: yMax });
-    };
-    frame = requestAnimationFrame(loop);
-
-    return () => {
-      cancelAnimationFrame(frame);
-      ro.disconnect();
-    };
+    untrack(() => mount());
+    rafId = requestAnimationFrame(refresh);
+    window.addEventListener('resize', onResize);
+    const ro = new ResizeObserver(onResize);
+    ro.observe(host);
+    return () => ro.disconnect();
   });
-
-  onDestroy(() => { plot?.destroy(); plot = null; });
+  onDestroy(() => {
+    if (rafId) cancelAnimationFrame(rafId);
+    plot?.destroy();
+    plot = null;
+    window.removeEventListener('resize', onResize);
+  });
 </script>
 
-<div class="time-chart-wrap">
-  <div bind:this={container} class="chart"></div>
-  {#if seriesDefs.length > 0}
-    <div class="legend" aria-hidden="true">
-      {#each seriesDefs as s, i}
-        <span class="chip">
-          <span class="chip-dot" style:background={resolvedColors[i]}></span>{s.label}
-        </span>
-      {/each}
-    </div>
+<div class="chart-wrapper">
+  <div bind:this={host} class="chart-host"></div>
+  <div class="legend">
+    {#each seriesDefs as def, i}
+      <span class="legend-item">
+        <span class="swatch" style="background: {resolvedColors[i] ?? def.color}"></span>
+        <span>{def.label}</span>
+      </span>
+    {/each}
+  </div>
+  {#if fullscreenTitle}
+    <button
+      class="fullscreen-btn"
+      onclick={() => showFull = true}
+      aria-label="Expand to full screen"
+    >⛶</button>
   {/if}
 </div>
 
+{#if showFull}
+  <ChartFullscreen
+    kind="time"
+    title={fullscreenTitle}
+    {xs} {ys} {seriesDefs} {count} {windowSec}
+    {yMin} {yMax} {yLabel} {xLabel}
+    onClose={() => showFull = false}
+  />
+{/if}
+
 <style>
-  .time-chart-wrap {
+  .chart-wrapper {
     position: relative;
     width: 100%;
     height: 100%;
-    min-height: 140px;
   }
-  .chart {
-    width: 100%;
-    height: 100%;
-  }
+  .chart-host { width: 100%; height: 100%; }
   .legend {
     position: absolute;
-    top: 4px;
-    right: 6px;
-    display: flex;
-    gap: 6px;
+    top: 4px; right: 36px;
+    display: flex; flex-wrap: wrap; gap: 8px;
     pointer-events: none;
-    padding: 3px 6px;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--bg-elev) 78%, transparent);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    font-family: var(--mono);
+  }
+  .legend-item {
+    display: inline-flex; align-items: center; gap: 4px;
     font-size: 10px;
     color: var(--fg-secondary);
-    z-index: 2;
+    background: var(--bg-elev);
+    padding: 2px 6px;
+    border-radius: var(--r-pill);
   }
-  .chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-  .chip-dot {
-    width: 8px;
-    height: 8px;
+  .swatch {
+    width: 8px; height: 8px;
     border-radius: 50%;
     display: inline-block;
   }
-  :global(.uplot, .uplot *) {
-    font-family: var(--mono) !important;
-    font-size: 10px !important;
+  .fullscreen-btn {
+    position: absolute;
+    top: 4px; right: 4px;
+    width: 28px; height: 28px;
+    background: var(--fill-tertiary);
+    color: var(--fg-secondary);
+    border: none;
+    border-radius: var(--r-control);
+    font-size: 14px;
+    cursor: pointer;
+    z-index: 2;
   }
+  .fullscreen-btn:active { opacity: 0.6; }
 </style>

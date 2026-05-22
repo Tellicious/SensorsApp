@@ -33,10 +33,8 @@ export class PeakHold {
   }
   push(v: number, t: number) {
     const a = Math.abs(v);
-    // First sample after construction/reset has no defined dt yet.
     const dt = this.lastT < 0 ? 0 : Math.max(0, (t - this.lastT) / 1000);
     this.lastT = t;
-    // dB → linear decay factor over `dt` seconds
     const factor = Math.pow(10, -this.decayDbPerSec * dt / 20);
     this.hold = Math.max(this.hold * factor, a);
   }
@@ -45,114 +43,166 @@ export class PeakHold {
 
 /**
  * Sliding-window RMS over the last `windowSec` of samples.
- * Uses a circular buffer of squared values plus a running sum.
+ *
+ * Implementation: explicit (head, tail, count) pointers into a circular
+ * Float64Array. On every push:
+ *   1. If the buffer is full at capacity, drop one from tail.
+ *   2. Append the new squared value at head, advance head.
+ *   3. Advance tail past any entries older than (t − windowMs).
+ *
+ * Numerical safety: floating-point cancellation in the running sum can
+ * accumulate; we clamp tiny negatives to 0. After ~1M samples we also
+ * trigger a full recompute to avoid drift.
+ *
+ * History: the previous implementation conflated "buffer count" with
+ * "in-window count" and produced negative sums after ~1 s of acquisition,
+ * which is why RMS / Crest read 0 or NaN and per-axis Avg showed wild
+ * numbers like 1000 m/s² in the UI.
  */
 export class RollingRms {
   private buf: Float64Array;
   private times: Float64Array;
+  private capacity: number;
   private head = 0;
-  private filled = false;
-  private sumSq = 0;
+  private tail = 0;
   private count = 0;
+  private sumSq = 0;
   private windowMs: number;
+  private sinceCompact = 0;
 
   constructor(capacity: number, windowSec: number) {
+    this.capacity = capacity;
     this.buf = new Float64Array(capacity);
     this.times = new Float64Array(capacity);
     this.windowMs = windowSec * 1000;
   }
 
   push(v: number, t: number) {
-    if (this.filled) {
-      // remove tail until it fits, in case window is shorter than buffer
-      // (best-effort O(1) amortized)
-      this.sumSq -= this.buf[this.head];
-    }
-    this.buf[this.head] = v * v;
+    const sq = v * v;
+    this.buf[this.head] = sq;
     this.times[this.head] = t;
-    this.sumSq += v * v;
-    this.head++;
-    if (this.head >= this.buf.length) { this.head = 0; this.filled = true; }
-    this.count = this.filled ? this.buf.length : this.head;
+    this.sumSq += sq;
+    this.head = (this.head + 1) % this.capacity;
+    this.count++;
 
-    // drop samples older than windowMs
-    const cutoff = t - this.windowMs;
-    let scanned = 0;
-    while (scanned < this.count) {
-      // tail index
-      const tail = this.filled
-        ? (this.head + (this.buf.length - this.count) + scanned) % this.buf.length
-        : scanned;
-      if (this.times[tail] >= cutoff) break;
-      this.sumSq -= this.buf[tail];
-      scanned++;
+    // Buffer overflow: drop oldest
+    if (this.count > this.capacity) {
+      this.sumSq -= this.buf[this.tail];
+      this.tail = (this.tail + 1) % this.capacity;
+      this.count = this.capacity;
     }
-    // ...note: we don't physically remove, just adjust count for RMS
-    this.count -= scanned;
-    if (this.count < 0) this.count = 0;
+
+    // Drop samples older than the window
+    const cutoff = t - this.windowMs;
+    while (this.count > 0 && this.times[this.tail] < cutoff) {
+      this.sumSq -= this.buf[this.tail];
+      this.tail = (this.tail + 1) % this.capacity;
+      this.count--;
+    }
+
+    // FP safety
+    if (this.sumSq < 0) this.sumSq = 0;
+
+    // Periodic recompute to defeat drift on long runs
+    if (++this.sinceCompact > 100000) this.recompact();
+  }
+
+  private recompact() {
+    let s = 0;
+    let i = this.tail;
+    for (let k = 0; k < this.count; k++) {
+      s += this.buf[i];
+      i = (i + 1) % this.capacity;
+    }
+    this.sumSq = Math.max(0, s);
+    this.sinceCompact = 0;
   }
 
   get rms() {
     return this.count > 0 ? Math.sqrt(this.sumSq / this.count) : 0;
   }
   reset() {
-    this.head = 0; this.filled = false; this.sumSq = 0; this.count = 0;
+    this.head = 0; this.tail = 0; this.count = 0;
+    this.sumSq = 0; this.sinceCompact = 0;
     this.buf.fill(0); this.times.fill(0);
   }
   setWindow(sec: number) { this.windowMs = sec * 1000; }
 }
 
 /**
- * Rolling arithmetic mean over the last `windowSec`. Implementation mirrors
- * RollingRms but without the square — kept separate for clarity.
+ * Sliding-window arithmetic mean. Mirrors RollingRms exactly except
+ * the buffer stores raw values, not squares.
  */
 export class RollingMean {
   private buf: Float64Array;
   private times: Float64Array;
+  private capacity: number;
   private head = 0;
-  private filled = false;
-  private sum = 0;
+  private tail = 0;
   private count = 0;
+  private sum = 0;
   private windowMs: number;
+  private sinceCompact = 0;
 
   constructor(capacity: number, windowSec: number) {
+    this.capacity = capacity;
     this.buf = new Float64Array(capacity);
     this.times = new Float64Array(capacity);
     this.windowMs = windowSec * 1000;
   }
 
   push(v: number, t: number) {
-    if (this.filled) this.sum -= this.buf[this.head];
     this.buf[this.head] = v;
     this.times[this.head] = t;
     this.sum += v;
-    this.head++;
-    if (this.head >= this.buf.length) { this.head = 0; this.filled = true; }
-    this.count = this.filled ? this.buf.length : this.head;
+    this.head = (this.head + 1) % this.capacity;
+    this.count++;
+
+    if (this.count > this.capacity) {
+      this.sum -= this.buf[this.tail];
+      this.tail = (this.tail + 1) % this.capacity;
+      this.count = this.capacity;
+    }
 
     const cutoff = t - this.windowMs;
-    let scanned = 0;
-    while (scanned < this.count) {
-      const tail = this.filled
-        ? (this.head + (this.buf.length - this.count) + scanned) % this.buf.length
-        : scanned;
-      if (this.times[tail] >= cutoff) break;
-      this.sum -= this.buf[tail];
-      scanned++;
+    while (this.count > 0 && this.times[this.tail] < cutoff) {
+      this.sum -= this.buf[this.tail];
+      this.tail = (this.tail + 1) % this.capacity;
+      this.count--;
     }
-    this.count -= scanned;
-    if (this.count < 0) this.count = 0;
+
+    if (++this.sinceCompact > 100000) this.recompact();
+  }
+
+  private recompact() {
+    let s = 0;
+    let i = this.tail;
+    for (let k = 0; k < this.count; k++) {
+      s += this.buf[i];
+      i = (i + 1) % this.capacity;
+    }
+    this.sum = s;
+    this.sinceCompact = 0;
   }
 
   get mean() { return this.count > 0 ? this.sum / this.count : 0; }
   reset() {
-    this.head = 0; this.filled = false; this.sum = 0; this.count = 0;
+    this.head = 0; this.tail = 0; this.count = 0;
+    this.sum = 0; this.sinceCompact = 0;
     this.buf.fill(0); this.times.fill(0);
   }
   setWindow(sec: number) { this.windowMs = sec * 1000; }
 }
 
-/** Kurtosis (excess) over a sliding window — recomputed from circular buffer. */
+/**
+ * Excess kurtosis over a sliding sample-count window — recomputed from
+ * the circular buffer on read. Capacity defines the window length; the
+ * default of 256 covers ~4 s at 60 Hz which keeps the statistic responsive.
+ *
+ * The previous default capacity of 4096 (~68 s at 60 Hz) effectively
+ * never released old outliers, so a single transient at the start of an
+ * acquisition kept the displayed kurtosis high forever.
+ */
 export class RollingKurtosis {
   private buf: Float64Array;
   private head = 0;
@@ -203,11 +253,15 @@ export class ChannelStats {
     rmsWindowSec: number;
     meanWindowSec: number;
     peakHoldDecayDbPerSec: number;
+    /** Sample-count window for kurtosis. Defaults to min(256, capacity)
+        so the statistic stays responsive — capacity is set to be large
+        enough for the longest FFT, which is far too long for kurtosis. */
+    kurtosisCapacity?: number;
   }) {
     this.peakHold = new PeakHold(opts.peakHoldDecayDbPerSec);
     this.rms = new RollingRms(opts.capacity, opts.rmsWindowSec);
     this.mean = new RollingMean(opts.capacity, opts.meanWindowSec);
-    this.kurt = new RollingKurtosis(opts.capacity);
+    this.kurt = new RollingKurtosis(opts.kurtosisCapacity ?? Math.min(256, opts.capacity));
   }
 
   push(v: number, t: number) {

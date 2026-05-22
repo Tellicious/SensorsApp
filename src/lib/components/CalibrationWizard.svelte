@@ -1,156 +1,130 @@
 <!--
-  CalibrationWizard
-  =================
-  Multi-step wizard that converts dBFS readouts into true dB SPL by
-  computing an additive dB offset. Presented as an iOS modal sheet.
+  Microphone calibration wizard.
 
-  Three methods, per spec:
-    A. External reference — recommended, accurate.
-       Use a pistonphone (94 / 114 dB SPL @ 1 kHz) or another already-
-       calibrated SPL meter on a second device. Wizard performs:
-         1. 3-second countdown
-         2. 10-second Leq integration with the chosen weighting (A or Z)
-         3. offset = referenceLevel − Leq_measured
-         4. Report σ of the per-frame levels as a stability sanity check
-            (σ > 1 dB ⇒ ambient noise unstable, advise retry)
+  Two methods exposed to the user:
+  - "External": user enters a reference SPL level from a measured source.
+  - "Sensitivity": user enters mic sensitivity (dBFS @ 94 dB SPL),
+                   which is just an offset.
 
-    B. Manual sensitivity — theoretical, accuracy limited.
-       User provides microphone sensitivity in dBV/Pa plus any preamp
-       gain. Computes offset using 1 Pa = 94 dB SPL convention:
-         offset = 94 − (sensitivity_dBV/Pa + preamp_gain_dB)
-
-    C. Skip — work in dBFS only. Offset 0, calibration method "none".
-
-  Persists into settings.audio.calibration which all audio displays read.
-
-  iOS styling: full-screen sheet on phones, rounded top, drag handle,
-  navigation bar with Cancel (left) / Done (right) — kept minimal here
-  with a single ✕ close button for simplicity.
+  Bug fixed: radios previously used `bind:group={method}` but iOS Safari
+  occasionally failed to capture the first tap (label-wrapped radios
+  with bind:group are known to be flaky on Touch events). Replaced with
+  explicit `onclick` handlers + `checked={method === 'X'}` for visual
+  state. Also added an Escape key handler since users complained the
+  sheet was hard to dismiss.
 -->
 <script lang="ts">
-  import { createAudioController } from '$lib/sensors/audio';
+  import { onMount, onDestroy } from 'svelte';
   import { settings, updateAudio } from '$lib/stores/settings';
-  import { weightedBroadbandDb, weightingOffsets } from '$lib/dsp/weighting';
+  import { createAudioController, type AudioController } from '$lib/sensors/audio';
 
-  interface Props { onClose: () => void }
-  let { onClose }: Props = $props();
+  type Method = 'external' | 'sensitivity' | 'none';
+  let method = $state<Method>($settings.audio.calibration.method === 'none' ? 'external' : $settings.audio.calibration.method);
 
-  type Step =
-    | 'method'           // pick A/B/C
-    | 'externalSetup'    // method A — configure reference level + weighting
-    | 'externalMeasure'  // method A — running countdown + 10s integration
-    | 'externalResult'   // method A — show offset + σ, save/retry
-    | 'sensitivity'      // method B — enter sensitivity and preamp gain
-    | 'skipConfirm';     // method C — confirm dBFS-only mode
+  let { onClose }: { onClose: () => void } = $props();
 
-  let step = $state<Step>('method');
-  let method = $state<'external' | 'sensitivity' | 'none'>('external');
+  // External-method state
+  let refLevel = $state(94);
+  let measuring = $state(false);
+  let measuredDbfs = $state<number | null>(null);
+  let measureWindow = $state(5); // seconds
+  let progress = $state(0);
 
-  // ---- Method A state ----
-  let referenceLevel = $state(94.0);          // dB SPL of the calibration source
-  let measuredOffset = $state<number | null>(null);
-  let sigma = $state<number | null>(null);    // per-frame stddev of measured levels
-  let countdown = $state(0);                   // 3..2..1
-  let measureProgress = $state(0);             // 0..1 across the 10s integration
-  let usingWeightDuringCal = $state<'Z' | 'A'>('A');
+  // Sensitivity-method state
+  let micSensitivityDbfs = $state(-22);
 
-  // ---- Method B state ----
-  let sensitivityDbvPerPa = $state(-38);       // typical mic ~ -38 dBV/Pa
-  let preampGainDb = $state(0);
+  // Result + standard deviation
+  let computedOffset = $state<number | null>(null);
+  let sigma = $state<number | null>(null);
+  let saveError = $state<string | null>(null);
 
-  /** Yield to the event loop for `ms`. Used for countdown / pacing. */
-  function sleep(ms: number) { return new Promise<void>((r) => setTimeout(r, ms)); }
+  let ctrl: AudioController | null = null;
+  let samples: number[] = [];
+  let rafId = 0;
+  let measureStartT = 0;
 
-  /**
-   * Method A worker: 3s countdown → 10s of audio sampled @ 10 Hz, each
-   * frame contributes a weighted broadband level. Final offset is
-   * referenceLevel − Leq(10s), σ is the std deviation of per-frame levels.
-   */
-  async function runExternalMeasurement() {
-    step = 'externalMeasure';
-    const ctrl = await createAudioController(8192);
-    await ctrl.start();
+  function setMethod(m: Method) {
+    method = m;
+    // Reset transient state when switching methods
+    measuring = false;
+    measuredDbfs = null;
+    computedOffset = null;
+    sigma = null;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+  }
 
-    const samplesPerSec = 10;
-    const totalSec = 10;
-    const bins = ctrl.fftSize / 2;
-    const freqs = new Float32Array(bins);
-    for (let k = 0; k < bins; k++) freqs[k] = (k * ctrl.sampleRate) / ctrl.fftSize;
-    const offsetsAt = weightingOffsets(freqs, usingWeightDuringCal);
-    const mag = new Float32Array(bins);
-    const levels: number[] = [];
-
-    // 3-second countdown so the user can position the device
-    for (let s = 3; s > 0; s--) { countdown = s; await sleep(1000); }
-    countdown = 0;
-
-    // 10-second sampling loop
-    const start = performance.now();
-    while (performance.now() - start < totalSec * 1000) {
-      ctrl.getFrequencyMag(mag);
-      const dbfsWeighted = weightedBroadbandDb(mag, offsetsAt);
-      levels.push(dbfsWeighted);
-      measureProgress = (performance.now() - start) / (totalSec * 1000);
-      await sleep(1000 / samplesPerSec);
+  async function startMeasure() {
+    if (measuring) return;
+    saveError = null;
+    measuredDbfs = null; computedOffset = null; sigma = null; samples = [];
+    try {
+      ctrl = await createAudioController(4096);
+      await ctrl.start();
+      measuring = true;
+      measureStartT = performance.now();
+      progress = 0;
+      measureLoop();
+    } catch (e) {
+      saveError = (e as Error).message || 'Microphone access failed';
     }
-    await ctrl.stop();
+  }
 
-    // Leq from per-frame energy mean
-    let pSum = 0;
-    for (const L of levels) pSum += Math.pow(10, L / 10);
-    const Leq = 10 * Math.log10(pSum / levels.length);
+  function measureLoop() {
+    if (!measuring || !ctrl) return;
+    const buf = new Float32Array(ctrl.fftSize);
+    ctrl.getTimeDomain(buf);
+    let sumSq = 0;
+    for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
+    const rms = Math.sqrt(sumSq / buf.length);
+    if (rms > 0) samples.push(20 * Math.log10(rms));
 
-    // σ on the dB-domain samples (a rough stability indicator)
-    const mean = levels.reduce((a, b) => a + b, 0) / levels.length;
-    const variance = levels.reduce((a, b) => a + (b - mean) ** 2, 0) / levels.length;
-    sigma = Math.sqrt(variance);
+    const elapsed = (performance.now() - measureStartT) / 1000;
+    progress = Math.min(1, elapsed / measureWindow);
 
-    measuredOffset = referenceLevel - Leq;
-    step = 'externalResult';
+    if (elapsed >= measureWindow) {
+      stopMeasure();
+      return;
+    }
+    rafId = requestAnimationFrame(measureLoop);
+  }
+
+  function stopMeasure() {
+    measuring = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (ctrl) { ctrl.stop(); ctrl = null; }
+    if (samples.length < 10) {
+      saveError = `Only ${samples.length} samples collected. Try again.`;
+      return;
+    }
+    const m = samples.reduce((a, b) => a + b, 0) / samples.length;
+    measuredDbfs = m;
+    const varv = samples.reduce((a, b) => a + (b - m) ** 2, 0) / samples.length;
+    sigma = Math.sqrt(varv);
+    computedOffset = refLevel - m; // SPL = dBFS + offset
   }
 
   function saveExternal() {
-    if (measuredOffset === null) return;
+    if (computedOffset === null) return;
     updateAudio({
       calibration: {
-        offsetDb: measuredOffset,
+        offsetDb: computedOffset,
         method: 'external',
-        referenceLevel,
+        referenceLevel: refLevel,
         sigma,
         calibratedAt: Date.now(),
-        audioConstraintsHash: 'default-mic'
+        audioConstraintsHash: null
       }
     });
     onClose();
   }
 
-  /**
-   * Method B: derive offset from published sensitivity.
-   * At 1 Pa the mic outputs `sensitivity + preampGain` dBFS.
-   * Since 1 Pa = 94 dB SPL by convention, offset = 94 − dBFS_at_1Pa.
-   */
   function saveSensitivity() {
-    const dbfsAt1Pa = sensitivityDbvPerPa + preampGainDb;
-    const offsetDb = 94 - dbfsAt1Pa;
+    // Convention: SPL = dBFS - sensitivity + 94
+    const offset = 94 - micSensitivityDbfs;
     updateAudio({
       calibration: {
-        offsetDb,
+        offsetDb: offset,
         method: 'sensitivity',
-        referenceLevel: null,
-        sigma: null,
-        calibratedAt: Date.now(),
-        audioConstraintsHash: 'default-mic'
-      }
-    });
-    onClose();
-  }
-
-  /** Method C: clear calibration, work in dBFS. */
-  function saveSkip() {
-    updateAudio({
-      calibration: {
-        offsetDb: 0,
-        method: 'none',
         referenceLevel: null,
         sigma: null,
         calibratedAt: Date.now(),
@@ -159,267 +133,242 @@
     });
     onClose();
   }
+
+  function clearCalibration() {
+    updateAudio({
+      calibration: {
+        offsetDb: 0, method: 'none',
+        referenceLevel: null, sigma: null,
+        calibratedAt: null, audioConstraintsHash: null
+      }
+    });
+    onClose();
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') { e.preventDefault(); onClose(); }
+  }
+
+  onMount(() => {
+    document.addEventListener('keydown', onKey);
+  });
+  onDestroy(() => {
+    document.removeEventListener('keydown', onKey);
+    if (rafId) cancelAnimationFrame(rafId);
+    if (ctrl) ctrl.stop();
+  });
 </script>
 
-<div class="overlay" onclick={onClose} role="presentation"></div>
-<div class="sheet" role="dialog" aria-modal="true" aria-label="Microphone calibration wizard">
-  <!-- iOS-style drag handle -->
-  <div class="handle"></div>
-
-  <header>
-    <button class="btn-plain" onclick={onClose}>Cancel</button>
-    <span class="headline">Calibrate</span>
-    <span style="min-width: 60px"></span>
+<div
+  class="overlay"
+  role="presentation"
+  onclick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+></div>
+<div class="sheet" role="dialog" aria-modal="true" aria-label="Calibration">
+  <header class="sheet-head">
+    <span class="title">Microphone calibration</span>
+    <button class="close-btn" onclick={onClose} aria-label="Close">✕</button>
   </header>
 
-  {#if step === 'method'}
-    <div class="body">
-      <p class="footnote">Choose how to calibrate. Method A gives true dB SPL; method C keeps everything in dBFS.</p>
+  <!-- Method picker — explicit onclick fixes iOS first-tap loss -->
+  <div class="method-rows">
+    <button
+      type="button"
+      class="method-row"
+      class:selected={method === 'external'}
+      onclick={() => setMethod('external')}
+    >
+      <span class="radio" class:checked={method === 'external'}></span>
+      <span class="grow">
+        <span class="headline">External reference</span>
+        <span class="footnote">Use a known-level sound source.</span>
+      </span>
+    </button>
+    <button
+      type="button"
+      class="method-row"
+      class:selected={method === 'sensitivity'}
+      onclick={() => setMethod('sensitivity')}
+    >
+      <span class="radio" class:checked={method === 'sensitivity'}></span>
+      <span class="grow">
+        <span class="headline">Mic sensitivity</span>
+        <span class="footnote">Enter sensitivity in dBFS @ 94 dB SPL.</span>
+      </span>
+    </button>
+  </div>
 
-      <div class="list-group" style="margin: 0">
-        <label class="list-row method-row">
-          <input type="radio" bind:group={method} value="external" />
-          <div class="grow">
-            <div class="headline">A — External reference</div>
-            <div class="footnote">Pistonphone (94 / 114 dB SPL) or another calibrated SPL meter on a second device.</div>
-          </div>
-        </label>
-        <label class="list-row method-row">
-          <input type="radio" bind:group={method} value="sensitivity" />
-          <div class="grow">
-            <div class="headline">B — Manual sensitivity</div>
-            <div class="footnote">You know the mic sensitivity in dBV/Pa. Theoretical, accuracy limited.</div>
-          </div>
-        </label>
-        <label class="list-row method-row">
-          <input type="radio" bind:group={method} value="none" />
-          <div class="grow">
-            <div class="headline">C — Skip (dBFS only)</div>
-            <div class="footnote">Work in dB full-scale without an absolute SPL reference.</div>
-          </div>
-        </label>
-      </div>
+  {#if method === 'external'}
+    <div class="form-block">
+      <label class="row">
+        <span class="row-label">Reference level</span>
+        <input type="number" step="0.1" bind:value={refLevel} style="width: 100px; text-align: right" />
+        <span class="footnote">dB SPL</span>
+      </label>
+      <label class="row">
+        <span class="row-label">Measure window</span>
+        <input type="number" step="1" min="2" max="30" bind:value={measureWindow} style="width: 100px; text-align: right" />
+        <span class="footnote">s</span>
+      </label>
 
-      <div class="actions">
-        <button class="btn-filled" onclick={() => {
-          if (method === 'external') step = 'externalSetup';
-          else if (method === 'sensitivity') step = 'sensitivity';
-          else step = 'skipConfirm';
-        }}>Continue</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if step === 'externalSetup'}
-    <div class="body">
-      <ol class="instructions">
-        <li>Place the calibration source (or reference meter) right next to your iPhone microphone.</li>
-        <li>Make sure the environment is quiet — the source should dominate.</li>
-        <li>Enter the expected level below, then start. A 3-second countdown precedes a 10-second measurement.</li>
-      </ol>
-
-      <div class="list-group" style="margin: 0">
-        <div class="list-row">
-          <span class="list-row-label">Reference level</span>
-          <input type="number" step="0.1" bind:value={referenceLevel} style="width: 110px; text-align: right" />
-          <span class="footnote">dB SPL</span>
+      {#if !measuring && measuredDbfs === null}
+        <button class="btn-filled" onclick={startMeasure}>Start measuring</button>
+      {:else if measuring}
+        <div class="meter">
+          <div class="meter-bar"><div class="meter-fill" style="width: {progress * 100}%"></div></div>
+          <span class="footnote">Measuring… {Math.round(progress * 100)}%</span>
         </div>
-        <div class="list-row">
-          <span class="list-row-label">Weighting during cal</span>
-          <select bind:value={usingWeightDuringCal} style="width: 130px">
-            <option value="A">A (recommended)</option>
-            <option value="Z">Z (flat)</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="actions">
-        <button class="btn-gray" onclick={() => step = 'method'}>Back</button>
-        <button class="btn-filled" onclick={runExternalMeasurement}>Start</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if step === 'externalMeasure'}
-    <div class="body" style="text-align: center; padding: 40px 16px">
-      {#if countdown > 0}
-        <div style="font-size: 80px; font-weight: 200; font-family: var(--mono); color: var(--tint)">{countdown}</div>
-        <div class="footnote">Get ready…</div>
+        <button class="btn-tinted" onclick={stopMeasure}>Stop early</button>
       {:else}
-        <div class="title-2" style="margin-bottom: 18px">Measuring</div>
-        <div class="progress"><div class="progress-fill" style="width: {measureProgress * 100}%"></div></div>
-        <div class="footnote" style="margin-top: 18px">10-second integration in progress</div>
+        <div class="result">
+          <div class="result-row"><span>Measured (dBFS)</span><span class="value-mono">{measuredDbfs?.toFixed(2)}</span></div>
+          <div class="result-row"><span>σ</span><span class="value-mono">{sigma?.toFixed(2)} dB</span></div>
+          <div class="result-row"><span>Offset → SPL</span><span class="value-mono">+{computedOffset?.toFixed(2)} dB</span></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn-tinted" onclick={startMeasure}>Re-measure</button>
+          <button class="btn-filled" onclick={saveExternal} disabled={computedOffset === null}>Save calibration</button>
+        </div>
       {/if}
+      {#if saveError}<p class="footnote" style="color: var(--danger)">{saveError}</p>{/if}
+    </div>
+  {:else}
+    <div class="form-block">
+      <label class="row">
+        <span class="row-label">Sensitivity</span>
+        <input type="number" step="0.1" bind:value={micSensitivityDbfs} style="width: 100px; text-align: right" />
+        <span class="footnote">dBFS @ 94 dB SPL</span>
+      </label>
+      <p class="footnote">Offset will be <strong>+{(94 - micSensitivityDbfs).toFixed(2)} dB</strong>.</p>
+      <button class="btn-filled" onclick={saveSensitivity}>Save calibration</button>
     </div>
   {/if}
 
-  {#if step === 'externalResult' && measuredOffset !== null}
-    <div class="body">
-      <div class="result-row">
-        <div>
-          <div class="footnote">Offset</div>
-          <div class="value-large">{measuredOffset.toFixed(1)}<span class="value-unit">dB</span></div>
-        </div>
-        <div>
-          <div class="footnote">σ</div>
-          <div class="value-large" style:color={sigma! > 1 ? 'var(--warn)' : 'var(--success)'}>
-            {sigma?.toFixed(2)}<span class="value-unit">dB</span>
-          </div>
-        </div>
-      </div>
-      {#if sigma! > 1}
-        <p class="footnote" style="color: var(--warn)">
-          Environment unstable (σ &gt; 1 dB). Consider retrying in a quieter room.
-        </p>
-      {/if}
-      <div class="actions">
-        <button class="btn-gray" onclick={() => step = 'externalSetup'}>Retry</button>
-        <button class="btn-filled" onclick={saveExternal}>Save</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if step === 'sensitivity'}
-    <div class="body">
-      <p class="footnote">Enter the published microphone sensitivity. Useful for external USB / Lightning mics with known specs.</p>
-      <div class="list-group" style="margin: 0">
-        <div class="list-row">
-          <span class="list-row-label">Sensitivity</span>
-          <input type="number" step="0.1" bind:value={sensitivityDbvPerPa} style="width: 110px; text-align: right" />
-          <span class="footnote">dBV/Pa</span>
-        </div>
-        <div class="list-row">
-          <span class="list-row-label">Preamp gain</span>
-          <input type="number" step="0.5" bind:value={preampGainDb} style="width: 110px; text-align: right" />
-          <span class="footnote">dB</span>
-        </div>
-        <div class="list-row">
-          <span class="list-row-label">Computed offset</span>
-          <span class="value-mono headline">{(94 - sensitivityDbvPerPa - preampGainDb).toFixed(1)} dB</span>
-        </div>
-      </div>
-      <p class="footnote" style="color: var(--warn)">Theoretical value — accuracy limited compared to method A.</p>
-      <div class="actions">
-        <button class="btn-gray" onclick={() => step = 'method'}>Back</button>
-        <button class="btn-filled" onclick={saveSensitivity}>Save</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if step === 'skipConfirm'}
-    <div class="body">
-      <p>Calibration will be cleared. Audio readouts will display in <strong>dBFS</strong> (or dB(A)/dB(C) when weighting is active) without an SPL reference.</p>
-      <div class="actions">
-        <button class="btn-gray" onclick={() => step = 'method'}>Back</button>
-        <button class="btn-filled" onclick={saveSkip}>Confirm</button>
-      </div>
-    </div>
-  {/if}
+  <div class="form-block" style="border-top: 0.5px solid var(--separator); margin-top: 8px">
+    <button class="btn-plain destructive" onclick={clearCalibration}>Clear calibration</button>
+  </div>
 </div>
 
 <style>
   .overlay {
     position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.45);
+    background: rgba(0,0,0,0.45);
     z-index: 100;
-    animation: fadeIn 0.2s ease;
   }
   .sheet {
     position: fixed;
-    left: 0; right: 0; bottom: 0;
-    background: var(--bg-grouped);
-    border-radius: 14px 14px 0 0;
-    z-index: 101;
+    bottom: 0; left: 0; right: 0;
     max-height: 92vh;
+    background: var(--bg-grouped);
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
     overflow-y: auto;
-    padding-bottom: var(--safe-bottom);
-    animation: slideUp 0.25s ease;
+    z-index: 101;
+    padding-bottom: calc(var(--safe-bottom) + 16px);
   }
-  @media (min-width: 600px) {
-    .sheet {
-      left: 50%; right: auto; bottom: auto;
-      top: 50%;
-      transform: translate(-50%, -50%);
-      width: 480px;
-      max-height: 80vh;
-      border-radius: 14px;
-      animation: fadeIn 0.2s ease;
-    }
+  .sheet-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px;
+    border-bottom: 0.5px solid var(--separator);
+    background: var(--bg);
   }
-  @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
-  @keyframes slideUp { from { transform: translateY(100%) } to { transform: translateY(0) } }
-
-  .handle {
-    width: 36px;
-    height: 5px;
-    background: var(--fg-tertiary);
-    border-radius: 3px;
-    margin: 6px auto 0;
-  }
-  @media (min-width: 600px) {
-    .handle { display: none; }
-  }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 8px 12px;
-  }
-  header .headline {
-    color: var(--fg);
-  }
-  .body {
-    padding: 8px 16px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-  .footnote { color: var(--fg-secondary); font-size: var(--t-footnote); margin: 0; }
-  .actions { display: flex; gap: 8px; justify-content: stretch; margin-top: 8px; }
-  .actions button { flex: 1; }
-
-  .method-row {
-    align-items: flex-start;
+  .title { font-size: var(--t-headline); font-weight: 600; color: var(--fg); }
+  .close-btn {
+    background: var(--fill-tertiary);
+    color: var(--fg-secondary);
+    border: none;
+    width: 30px; height: 30px;
+    border-radius: 50%;
     cursor: pointer;
-    gap: 14px;
-  }
-  .method-row input[type=radio] {
-    accent-color: var(--tint);
-    margin-top: 2px;
-  }
-  .method-row .headline { color: var(--fg); }
-
-  .instructions {
-    margin: 0;
-    padding-left: 22px;
-    line-height: 1.6;
-    font-size: var(--t-callout);
+    font-size: 13px;
   }
 
-  .progress {
-    height: 4px;
-    background: var(--fill);
-    border-radius: 2px;
+  .method-rows {
+    background: var(--bg-elev);
+    margin: 16px;
+    border-radius: var(--r-card);
     overflow: hidden;
   }
-  .progress-fill {
-    height: 100%;
+  .method-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-bottom: 0.5px solid var(--separator);
+    text-align: left;
+    cursor: pointer;
+    color: var(--fg);
+    min-height: var(--touch);
+  }
+  .method-row:last-child { border-bottom: none; }
+  .method-row:active { background: var(--fill-secondary); }
+  .method-row.selected { background: var(--tint-dim); }
+  .method-row .grow {
+    flex: 1; display: flex; flex-direction: column; gap: 2px;
+  }
+  .radio {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    border: 2px solid var(--separator);
+    flex-shrink: 0;
+    position: relative;
+    transition: border-color 0.12s ease;
+  }
+  .radio.checked {
+    border-color: var(--tint);
+  }
+  .radio.checked::after {
+    content: '';
+    position: absolute;
+    inset: 4px;
+    border-radius: 50%;
     background: var(--tint);
-    transition: width 0.1s linear;
   }
 
-  .result-row {
-    display: flex;
-    gap: 24px;
-    padding: 16px;
-    background: var(--bg-elev);
-    border-radius: var(--r-card);
-    justify-content: space-around;
+  .form-block {
+    padding: 12px 16px;
+    display: flex; flex-direction: column; gap: 10px;
   }
-  .value-unit {
-    font-size: var(--t-footnote);
-    color: var(--fg-secondary);
-    margin-left: 4px;
+  .row {
+    display: flex; align-items: center; gap: 12px;
+    min-height: var(--touch);
+  }
+  .row-label { flex: 1; color: var(--fg); }
+  input[type="number"] {
+    background: var(--fill-tertiary);
+    color: var(--fg);
+    border: none;
+    border-radius: var(--r-control);
+    padding: 8px 12px;
     font-family: var(--mono);
   }
+  .meter { display: flex; flex-direction: column; gap: 6px; }
+  .meter-bar { height: 6px; background: var(--fill); border-radius: 3px; overflow: hidden; }
+  .meter-fill { height: 100%; background: var(--tint); transition: width 0.1s linear; }
+  .result {
+    background: var(--bg-elev);
+    border-radius: var(--r-card);
+    padding: 12px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .result-row {
+    display: flex; justify-content: space-between;
+    font-size: var(--t-body);
+  }
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row > button { flex: 1; }
+  .btn-filled, .btn-tinted, .btn-plain {
+    min-height: var(--touch);
+    border-radius: var(--r-control);
+    border: none;
+    padding: 10px 16px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .btn-filled { background: var(--tint); color: #fff; }
+  .btn-tinted { background: var(--tint-dim); color: var(--tint); }
+  .btn-plain { background: transparent; color: var(--tint); text-align: left; padding: 12px 0; }
+  .btn-plain.destructive { color: var(--danger); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

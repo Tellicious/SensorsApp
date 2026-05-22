@@ -9,12 +9,6 @@
  * On any write, this module also reflects the theme choice onto
  * `document.documentElement.dataset.theme` so the CSS variables in
  * app.css can pick the right palette without further bookkeeping.
- *
- * Helpers:
- *   - resetSettings()         → restore DEFAULTS
- *   - exportSettingsJson()    → pretty JSON for clipboard / file download
- *   - importSettingsJson(str) → parse + merge over DEFAULTS
- *   - updateMotion/Audio/Gps/Global({...patch}) → shallow patch a slice
  */
 import { writable, get } from 'svelte/store';
 import type { WindowName } from '$lib/dsp/windowing';
@@ -24,53 +18,63 @@ import type { Weighting } from '$lib/dsp/weighting';
 export type Theme = 'dark' | 'light' | 'auto';
 export type CoordFormat = 'decimal' | 'dms';
 export type Unit = 'si' | 'imperial';
+export type MapProvider = 'apple' | 'carto' | 'osm';
+
+/** Per-KPI visibility — one toggle per displayed metric. */
+export interface KpiVisibility {
+  peak: boolean;
+  rms: boolean;
+  avg: boolean;
+  crest: boolean;
+  kurt: boolean;
+  hold: boolean;
+  pkpk: boolean;
+}
 
 export interface MotionSettings {
-  // which channels to display
   showLinear: boolean;
   showRaw: boolean;
   showGyro: boolean;
   showOrientation: boolean;
   showMagnitude: boolean;
-  // axes
+  // Note: axisX/Y/Z still live here for persistence, but inline toggles
+  // on the chart page now write to them directly so the user doesn't
+  // need to open Settings to flip an axis.
   axisX: boolean;
   axisY: boolean;
   axisZ: boolean;
-  // time-domain window seconds
   timeWindowSec: number;
-  // FFT
-  fftSize: FftSize;
-  fftWindow: WindowName;
-  fftOverlapPct: 0 | 25 | 50 | 75;
-  fftScaleLog: boolean;       // y-axis log (dB)
-  fftFreqLog: boolean;        // x-axis log
-  fftAutoScale: boolean;
-  fftYMin: number;
-  fftYMax: number;
-  // KPI
-  rmsWindowSec: number;
-  meanWindowSec: number;
-  peakHoldDecayDbPerSec: number;
-  dominantFreqCount: number;
-  // 3D cube
-  showCube: boolean;
-}
-
-export interface AudioSettings {
-  // visualizations
-  showWaveform: boolean;
-  showSpectrum: boolean;
-  showSpectrogram: boolean;
-  waveformWindowMs: 50 | 100 | 500 | 1000;
-  // FFT
   fftSize: FftSize;
   fftWindow: WindowName;
   fftOverlapPct: 0 | 25 | 50 | 75;
   fftScaleLog: boolean;
   fftFreqLog: boolean;
-  // weighting
+  fftAutoScale: boolean;
+  fftYMin: number;
+  fftYMax: number;
+  rmsWindowSec: number;
+  meanWindowSec: number;
+  peakHoldDecayDbPerSec: number;
+  dominantFreqCount: number;
+  /** Exponential-smoothing factor for the dominant-freq magnitude EMA.
+      0 = no smoothing (jittery), ~0.85 = heavily damped (stable). */
+  dominantSmoothing: number;
+  showCube: boolean;
+  /** Per-KPI visibility for the Motion page. */
+  kpiVisible: KpiVisibility;
+}
+
+export interface AudioSettings {
+  showWaveform: boolean;
+  showSpectrum: boolean;
+  showSpectrogram: boolean;
+  waveformWindowMs: 50 | 100 | 500 | 1000;
+  fftSize: FftSize;
+  fftWindow: WindowName;
+  fftOverlapPct: 0 | 25 | 50 | 75;
+  fftScaleLog: boolean;
+  fftFreqLog: boolean;
   weighting: Weighting;
-  // calibration (dB offset added to weighted dBFS to get dB SPL)
   calibration: {
     offsetDb: number;
     method: 'external' | 'sensitivity' | 'none';
@@ -79,9 +83,10 @@ export interface AudioSettings {
     calibratedAt: number | null;
     audioConstraintsHash: string | null;
   };
-  // KPI
   rmsWindowSec: number;
   dominantFreqCount: number;
+  dominantSmoothing: number;
+  kpiVisible: KpiVisibility;
 }
 
 export interface GpsSettings {
@@ -89,6 +94,24 @@ export interface GpsSettings {
   movementThresholdMps: number;
   showMap: boolean;
   showTimeCharts: boolean;
+  /** Tile / SDK provider for the map.
+      - 'apple': MapKit JS — needs an Apple Developer JWT (set below).
+        Falls back to 'carto' if no token is provided.
+      - 'carto': CartoDB Voyager tiles — free, no token, closest to Apple Maps look.
+      - 'osm': OpenStreetMap default tiles. */
+  mapProvider: MapProvider;
+  /** MapKit JS authorization JWT. See https://developer.apple.com/maps/web/. */
+  appleMapsToken: string;
+  kpiVisible: {
+    distance: boolean;
+    speedMax: boolean;
+    speedMin: boolean;
+    speedAvg: boolean;
+    speedMedian: boolean;
+    timeMoving: boolean;
+    heading: boolean;
+    accuracy: boolean;
+  };
 }
 
 export interface GlobalSettings {
@@ -126,7 +149,12 @@ export const DEFAULTS: AllSettings = {
     meanWindowSec: 5,
     peakHoldDecayDbPerSec: 0.5,
     dominantFreqCount: 5,
-    showCube: false
+    dominantSmoothing: 0.85,
+    showCube: false,
+    kpiVisible: {
+      peak: true, rms: true, avg: true, crest: true,
+      kurt: true, hold: true, pkpk: true
+    }
   },
   audio: {
     showWaveform: true,
@@ -148,13 +176,24 @@ export const DEFAULTS: AllSettings = {
       audioConstraintsHash: null
     },
     rmsWindowSec: 1,
-    dominantFreqCount: 5
+    dominantFreqCount: 5,
+    dominantSmoothing: 0.9,
+    kpiVisible: {
+      peak: true, rms: true, avg: false, crest: true,
+      kurt: false, hold: false, pkpk: false
+    }
   },
   gps: {
     coordFormat: 'decimal',
     movementThresholdMps: 0.5,
     showMap: true,
-    showTimeCharts: true
+    showTimeCharts: true,
+    mapProvider: 'carto',
+    appleMapsToken: '',
+    kpiVisible: {
+      distance: true, speedMax: true, speedMin: false, speedAvg: true,
+      speedMedian: false, timeMoving: true, heading: true, accuracy: true
+    }
   }
 };
 
@@ -190,8 +229,7 @@ export const settings = writable<AllSettings>(load());
 
 settings.subscribe((v) => {
   if (typeof localStorage === 'undefined') return;
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(v)); } catch {}
-  // apply theme to <html>
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(v)); } catch { /* */ }
   if (typeof document !== 'undefined') {
     document.documentElement.dataset.theme = v.global.theme;
   }
@@ -212,7 +250,6 @@ export function importSettingsJson(json: string) {
   }
 }
 
-/** Update a slice of settings without recreating the whole object. */
 export function updateMotion(patch: Partial<MotionSettings>) {
   settings.update((s) => ({ ...s, motion: { ...s.motion, ...patch } }));
 }
@@ -224,4 +261,24 @@ export function updateGps(patch: Partial<GpsSettings>) {
 }
 export function updateGlobal(patch: Partial<GlobalSettings>) {
   settings.update((s) => ({ ...s, global: { ...s.global, ...patch } }));
+}
+
+/** Patch a Motion KpiVisibility field. */
+export function setMotionKpi(key: keyof KpiVisibility, value: boolean) {
+  settings.update((s) => ({
+    ...s,
+    motion: { ...s.motion, kpiVisible: { ...s.motion.kpiVisible, [key]: value } }
+  }));
+}
+export function setAudioKpi(key: keyof KpiVisibility, value: boolean) {
+  settings.update((s) => ({
+    ...s,
+    audio: { ...s.audio, kpiVisible: { ...s.audio.kpiVisible, [key]: value } }
+  }));
+}
+export function setGpsKpi(key: keyof GpsSettings['kpiVisible'], value: boolean) {
+  settings.update((s) => ({
+    ...s,
+    gps: { ...s.gps, kpiVisible: { ...s.gps.kpiVisible, [key]: value } }
+  }));
 }
