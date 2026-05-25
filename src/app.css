@@ -168,6 +168,18 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- iOS Safari canvas overlay suppression ---------------- */
+/* iOS Safari auto-injects a floating "fullscreen" control over canvas
+   elements that update via requestAnimationFrame (it heuristically
+   treats them as video-like). These properties opt every chart canvas
+   out of that overlay and Safari's text-selection / look-up popups. */
+canvas {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
 /* ---- TYPOGRAPHY UTILITIES --------------------------------- */
 .large-title { font-size: var(--t-large-title); font-weight: 700; letter-spacing: 0.37px; }
 .title-1     { font-size: var(--t-title-1);    font-weight: 700; letter-spacing: 0.36px; }

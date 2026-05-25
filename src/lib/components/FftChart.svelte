@@ -1,192 +1,152 @@
 <!--
-  Inline FFT magnitude chart powered by uPlot.
+  FftChart
+  ========
+  Spectrum display based on uPlot. One or more magnitude/dB series share
+  a common frequency axis. Supports linear or logarithmic X (frequency)
+  and Y (dB vs linear). Fixed-range or auto-scaled Y.
 
-  Same wrapper pattern as TimeChart: a small ⛶ button in the corner
-  opens a ChartFullscreen overlay with touch-driven pan / zoom. Both
-  inline and fullscreen instances read from the same magnitude buffer
-  reference so the fullscreen view streams live.
+  Like TimeChart, CSS variable colors are resolved to literal values at
+  mount time so canvas2D understands them.
 -->
 <script lang="ts">
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
-  import ChartFullscreen from './ChartFullscreen.svelte';
 
-  interface SeriesDef { label: string; color: string; }
+  interface SeriesDef { label: string; color: string }
+
   interface Props {
+    /** Bin-center frequencies in Hz. */
     freqs: Float32Array;
+    /** Magnitude or dB array per series, same length as `freqs`. */
     spectra: Float32Array[];
+    /** One label + color per series. */
     seriesDefs: SeriesDef[];
-    logX?: boolean;
-    logY?: boolean;
-    autoScale?: boolean;
+    /** Use logarithmic Y axis (dB) vs linear magnitude. */
+    logY: boolean;
+    /** Use logarithmic X axis (frequency). */
+    logX: boolean;
+    /** Fixed Y minimum (used only when autoScale is false). */
     yMin?: number;
+    /** Fixed Y maximum. */
     yMax?: number;
-    fullscreenTitle?: string;
+    /** If true, ignore yMin/yMax and let uPlot pick. */
+    autoScale: boolean;
+    /** Optional Y-axis label. */
+    yLabel?: string;
   }
+
   let {
-    freqs, spectra, seriesDefs,
-    logX = false, logY = true, autoScale = true,
-    yMin, yMax,
-    fullscreenTitle = ''
+    freqs, spectra, seriesDefs, logY, logX,
+    yMin = -120, yMax = 0, autoScale = true,
+    yLabel = 'dB'
   }: Props = $props();
 
-  let host: HTMLDivElement;
+  let container: HTMLDivElement;
   let plot: uPlot | null = null;
-  let rafId = 0;
-  let showFull = $state(false);
-  let resolvedColors = $state<string[]>([]);
+  let frame = 0;
 
-  function resolveColor(c: string): string {
-    if (!c.startsWith('var(')) return c;
-    const name = c.slice(4, -1).trim();
+  /** Resolve CSS variable to literal color value. See TimeChart for rationale. */
+  function resolveColor(value: string): string {
+    if (!value.startsWith('var(')) return value;
+    const name = value.slice(4, -1).trim();
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
   }
 
-  function buildSeries(): uPlot.Series[] {
-    const arr: uPlot.Series[] = [{}];
-    for (const def of seriesDefs) {
-      arr.push({
-        label: def.label,
-        stroke: resolveColor(def.color),
-        width: 1.4,
-        spanGaps: false
-      });
-    }
-    return arr;
+  function makeOpts(w: number, h: number): uPlot.Options {
+    const axisColor = resolveColor('var(--fg-secondary)');
+    const gridColor = resolveColor('var(--grid)');
+    const tickColor = resolveColor('var(--separator)');
+    void logY;
+    return {
+      width: w,
+      height: h,
+      pxAlign: 0,
+      cursor: { show: true, x: true, y: false },
+      legend: { show: false },
+      scales: {
+        // uPlot scale distribution: 1=linear, 3=log. Y log-axis is handled
+        // by feeding dB values (precomputed elsewhere), not via scale.distr.
+        x: { time: false, distr: logX ? 3 : 1 },
+        y: { auto: autoScale, distr: 1 }
+      },
+      axes: [
+        {
+          stroke: axisColor,
+          grid: { stroke: gridColor, width: 1 },
+          ticks: { stroke: tickColor, width: 1 },
+          values: (_u, splits) =>
+            splits.map((v) => (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0) + 'Hz'))
+        },
+        {
+          stroke: axisColor,
+          grid: { stroke: gridColor, width: 1 },
+          ticks: { stroke: tickColor, width: 1 },
+          label: yLabel,
+          labelGap: 4,
+          labelSize: 14,
+          // uPlot's default Y-axis gutter (~50px) clips 4-char labels like
+          // "-100" — widen so negative signs and 3-digit values fit.
+          size: 58
+        }
+      ],
+      series: [
+        {},
+        ...seriesDefs.map((s) => ({
+          label: s.label,
+          stroke: resolveColor(s.color),
+          width: 1.2,
+          points: { show: false }
+        }))
+      ]
+    };
   }
 
   function buildData(): uPlot.AlignedData {
-    const f = Array.from(freqs) as number[];
-    const data: uPlot.AlignedData = [f];
-    for (const s of spectra) data.push(Array.from(s) as number[]);
-    return data;
-  }
-
-  function mount() {
-    if (!host) return;
-    const tickColor  = getComputedStyle(document.documentElement).getPropertyValue('--separator').trim();
-    const labelColor = getComputedStyle(document.documentElement).getPropertyValue('--fg-tertiary').trim();
-
-    resolvedColors = seriesDefs.map(d => resolveColor(d.color));
-
-    const opts: uPlot.Options = {
-      width: host.clientWidth,
-      height: host.clientHeight,
-      legend: { show: false },
-      cursor: { drag: { x: false, y: false }, points: { show: false } },
-      scales: {
-        x: { time: false, distr: logX ? 3 : 1 },
-        y: {
-          auto: autoScale,
-          range: (!autoScale && yMin !== undefined && yMax !== undefined)
-            ? [yMin, yMax] : undefined,
-          distr: logY ? 1 : 1   // we feed dB values directly; the data IS log-amplitude
-        }
-      },
-      axes: [
-        { stroke: labelColor, grid: { stroke: tickColor, width: 0.5 }, ticks: { stroke: tickColor }, label: 'Hz' },
-        { stroke: labelColor, grid: { stroke: tickColor, width: 0.5 }, ticks: { stroke: tickColor }, label: 'dB' }
-      ],
-      series: buildSeries()
-    };
-    plot = new uPlot(opts, buildData(), host);
-  }
-
-  function refresh() {
-    if (!plot) return;
-    plot.setData(buildData(), false);
-    rafId = requestAnimationFrame(refresh);
-  }
-
-  function onResize() {
-    if (!plot || !host) return;
-    plot.setSize({ width: host.clientWidth, height: host.clientHeight });
+    return [freqs, ...spectra] as unknown as uPlot.AlignedData;
   }
 
   onMount(() => {
-    untrack(() => mount());
-    rafId = requestAnimationFrame(refresh);
-    window.addEventListener('resize', onResize);
-    const ro = new ResizeObserver(onResize);
-    ro.observe(host);
-    return () => ro.disconnect();
+    plot = new uPlot(makeOpts(container.clientWidth, container.clientHeight), buildData(), container);
+
+    // Suppress iOS Safari's auto-injected canvas overlay (the floating chip
+    // with a "fullscreen" button in the top-right of each chart). Safari
+    // treats RAF-driven canvases as video-like and offers media controls;
+    // these attributes opt out where Safari respects them.
+    container.querySelectorAll('canvas').forEach((c) => {
+      c.setAttribute('disablepictureinpicture', '');
+      (c as HTMLCanvasElement & { disablePictureInPicture?: boolean }).disablePictureInPicture = true;
+    });
+
+    const ro = new ResizeObserver(() => {
+      plot?.setSize({ width: container.clientWidth, height: container.clientHeight });
+    });
+    ro.observe(container);
+
+    // 20 fps refresh is plenty for spectrum display
+    let last = 0;
+    const loop = (t: number) => {
+      frame = requestAnimationFrame(loop);
+      if (t - last < 50) return;
+      last = t;
+      if (!plot) return;
+      plot.setData(buildData(), false);
+      if (!autoScale) plot.setScale('y', { min: yMin, max: yMax });
+    };
+    frame = requestAnimationFrame(loop);
+
+    return () => { cancelAnimationFrame(frame); ro.disconnect(); };
   });
-  onDestroy(() => {
-    if (rafId) cancelAnimationFrame(rafId);
-    plot?.destroy();
-    plot = null;
-    window.removeEventListener('resize', onResize);
-  });
+
+  onDestroy(() => { plot?.destroy(); plot = null; });
 </script>
 
-<div class="chart-wrapper">
-  <div bind:this={host} class="chart-host"></div>
-  <div class="legend">
-    {#each seriesDefs as def, i}
-      <span class="legend-item">
-        <span class="swatch" style="background: {resolvedColors[i] ?? def.color}"></span>
-        <span>{def.label}</span>
-      </span>
-    {/each}
-  </div>
-  {#if fullscreenTitle}
-    <button
-      class="fullscreen-btn"
-      onclick={() => showFull = true}
-      aria-label="Expand to full screen"
-    >⛶</button>
-  {/if}
-</div>
-
-{#if showFull}
-  <ChartFullscreen
-    kind="fft"
-    title={fullscreenTitle}
-    {freqs} {spectra} {seriesDefs}
-    {logX} {logY} {autoScale} {yMin} {yMax}
-    yLabel="dB"
-    onClose={() => showFull = false}
-  />
-{/if}
+<div bind:this={container} class="chart"></div>
 
 <style>
-  .chart-wrapper {
-    position: relative;
-    width: 100%;
-    height: 100%;
+  .chart { width: 100%; height: 100%; min-height: 160px; }
+  :global(.uplot, .uplot *) {
+    font-family: var(--mono) !important;
+    font-size: 10px !important;
   }
-  .chart-host { width: 100%; height: 100%; }
-  .legend {
-    position: absolute;
-    top: 4px; right: 36px;
-    display: flex; flex-wrap: wrap; gap: 8px;
-    pointer-events: none;
-  }
-  .legend-item {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px;
-    color: var(--fg-secondary);
-    background: var(--bg-elev);
-    padding: 2px 6px;
-    border-radius: var(--r-pill);
-  }
-  .swatch {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    display: inline-block;
-  }
-  .fullscreen-btn {
-    position: absolute;
-    top: 4px; right: 4px;
-    width: 28px; height: 28px;
-    background: var(--fill-tertiary);
-    color: var(--fg-secondary);
-    border: none;
-    border-radius: var(--r-control);
-    font-size: 14px;
-    cursor: pointer;
-    z-index: 2;
-  }
-  .fullscreen-btn:active { opacity: 0.6; }
 </style>
